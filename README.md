@@ -57,9 +57,22 @@ Probar: `curl "http://localhost:3001/api/matches?date=2026-08-16"`
 
 - `GET /api/matches?date=YYYY-MM-DD`
 - `GET /api/search?q=boca` → busca sobre el índice de equipos cacheado
-- `GET /api/teams/:id` → ficha del equipo (info, cancha, plantel, últimos
-  5 partidos jugados)
+- `GET /api/teams/:id` → ficha del equipo: info, cancha, **estadísticas de
+  tabla** (posición, PJ/PG/PE/PP, goles, puntos — `null` si la competencia
+  no tiene fase de tabla, como una copa eliminatoria), plantel, últimos 5
+  partidos jugados, y **alineación en vivo** (`null` salvo que el equipo
+  tenga un partido jugándose en ese momento)
 - `GET /health`
+
+## Lo más frágil de todo (leer antes de tocar `dataSource.js`)
+
+`fetchTeamStats` y `fetchLiveLineup` son las partes más riesgosas de todo
+el backend: dependen de la forma exacta del JSON de `/standings` y
+`/summary?event=`, que ESPN no documenta en ningún lado oficial. Los
+armé con el mejor criterio posible (probé varios nombres de campo
+alternativos para cada stat, ver `STAT_ALIASES`), pero si algún día algo
+deja de funcionar ahí, revisá primero la respuesta cruda de esos dos
+endpoints contra un partido real antes de asumir que el código está mal.
 
 ## Si ESPN cambia el formato y algo deja de andar
 
