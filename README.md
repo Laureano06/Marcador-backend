@@ -49,6 +49,20 @@ que usa la API para cada torneo (podés verlo pegándole a
 3. `npm install && npm start`
 4. Probar: `curl "http://localhost:3001/api/matches?date=2026-08-16"`
 
+## Endpoints
+
+- `GET /api/matches?date=YYYY-MM-DD` → todos los partidos de ese día,
+  todas las ligas incluidas, con `homeId`/`awayId` en cada uno (para
+  favoritos y para linkear a la ficha de equipo).
+- `GET /api/search?q=boca` → `{ teams: [...], leagues: [...] }`. Mínimo 3
+  caracteres. Cacheado 30 min por texto de búsqueda.
+- `GET /api/teams/:id` → ficha del equipo: info básica, cancha, plantel
+  agrupado por posición, y últimos 5 partidos jugados (como indicador de
+  forma reciente — la estadística de temporada completa de API-Football
+  pide liga+temporada específica, así que no la usamos acá). Cacheado 24hs
+  por equipo.
+- `GET /health` → chequeo simple.
+
 ## Qué se borró de la versión anterior
 
 - `worker.js` — ya no hace falta, ver arriba.

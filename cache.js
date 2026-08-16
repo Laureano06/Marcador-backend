@@ -1,27 +1,30 @@
-// Cache en memoria, indexado por fecha ("YYYY-MM-DD"), con vencimiento
-// (TTL). El plan free de API-Football permite 100 requests/día — por eso
-// acá NO hay un worker en loop pidiendo todo el tiempo: cada fecha se pide
-// una sola vez a la API externa y se reutiliza hasta que vence el TTL.
+// Cache en memoria genérico: cualquier módulo puede guardar algo bajo una
+// clave, con su propio tiempo de vencimiento (TTL). Se usa para partidos
+// por día, resultados de búsqueda, y fichas de equipo — cada uno con un
+// TTL distinto, porque no todos cambian con la misma frecuencia.
 //
-// En producción esto se reemplaza por Redis (con el mismo concepto de TTL,
-// pero persistente entre reinicios).
+// En producción esto se reemplaza por Redis (mismo concepto de TTL, pero
+// persistente entre reinicios).
 
-const store = {}; // { "2026-08-16": { updatedAt, matches } }
+const store = {}; // { key: { updatedAt, ttlMs, data } }
 
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60 * 1000); // 5 min
-
-function getCached(dateKey) {
-  return store[dateKey] || null;
+function getCached(key) {
+  const entry = store[key];
+  return entry ? entry.data : null;
 }
 
-function setCached(dateKey, matches) {
-  store[dateKey] = { updatedAt: Date.now(), matches };
+function getCachedMeta(key) {
+  return store[key] || null; // incluye updatedAt, útil para mostrar "actualizado hace..."
 }
 
-function isExpired(dateKey) {
-  const entry = store[dateKey];
+function setCached(key, data, ttlMs) {
+  store[key] = { updatedAt: Date.now(), ttlMs, data };
+}
+
+function isExpired(key) {
+  const entry = store[key];
   if (!entry) return true;
-  return Date.now() - entry.updatedAt > CACHE_TTL_MS;
+  return Date.now() - entry.updatedAt > entry.ttlMs;
 }
 
-module.exports = { getCached, setCached, isExpired };
+module.exports = { getCached, getCachedMeta, setCached, isExpired };
