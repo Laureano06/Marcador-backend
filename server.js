@@ -3,21 +3,32 @@ const express = require("express");
 const cors = require("cors");
 const {
   fetchMatchesForDate,
-  searchTeams,
-  searchLeagues,
+  buildTeamIndex,
   fetchTeamProfile,
+  LEAGUES,
 } = require("./dataSource");
 const { getCached, getCachedMeta, setCached, isExpired } = require("./cache");
 
 const app = express();
-app.use(cors()); // el frontend puede vivir en otro origen (Vercel, file://, etc.)
+app.use(cors());
 
-// TTLs pensados para cuidar la cuota del plan free (100 requests/día):
-// los partidos de un día cambian seguido, los planteles y búsquedas casi
-// nunca, así que se cachean mucho más tiempo.
 const MATCHES_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60 * 1000); // 5 min
-const SEARCH_TTL_MS = 30 * 60 * 1000; // 30 min
+const TEAM_INDEX_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
+
+const TEAM_INDEX_KEY = "team-index";
+
+// Se asegura de que el índice de equipos esté fresco, y lo devuelve.
+// Un solo lugar que arma el índice, lo usan tanto /api/search como
+// /api/teams/:id (para saber en qué liga buscar el plantel).
+async function getFreshTeamIndex() {
+  if (isExpired(TEAM_INDEX_KEY)) {
+    console.log("[api] reconstruyendo índice de equipos...");
+    const index = await buildTeamIndex();
+    setCached(TEAM_INDEX_KEY, index, TEAM_INDEX_TTL_MS);
+  }
+  return getCached(TEAM_INDEX_KEY);
+}
 
 // GET /api/matches?date=2026-08-16
 app.get("/api/matches", async (req, res) => {
@@ -32,7 +43,7 @@ app.get("/api/matches", async (req, res) => {
 
   try {
     if (isExpired(key)) {
-      console.log(`[api] pidiendo partidos de ${date} a la API externa...`);
+      console.log(`[api] pidiendo partidos de ${date} a ESPN...`);
       const matches = await fetchMatchesForDate(date);
       setCached(key, matches, MATCHES_TTL_MS);
     } else {
@@ -54,18 +65,15 @@ app.get("/api/matches", async (req, res) => {
         stale: true,
       });
     }
-    res
-      .status(502)
-      .json({ error: "No se pudo obtener partidos de la API externa" });
+    res.status(502).json({ error: "No se pudo obtener partidos de ESPN" });
   }
 });
 
 // GET /api/search?q=boca
-// Busca equipos y ligas a la vez. Se cachea por texto de búsqueda para no
-// gastar cuota si mucha gente busca lo mismo (o la misma persona repite
-// la búsqueda).
+// Filtra sobre el índice de equipos ya cacheado (no gasta requests nuevas
+// contra ESPN en cada búsqueda) + la lista fija de ligas.
 app.get("/api/search", async (req, res) => {
-  const q = (req.query.q || "").trim();
+  const q = (req.query.q || "").trim().toLowerCase();
 
   if (q.length < 3) {
     return res
@@ -73,36 +81,45 @@ app.get("/api/search", async (req, res) => {
       .json({ error: "La búsqueda necesita al menos 3 caracteres" });
   }
 
-  const key = `search:${q.toLowerCase()}`;
-
   try {
-    if (isExpired(key)) {
-      console.log(`[api] buscando "${q}" en la API externa...`);
-      const [teams, leagues] = await Promise.all([
-        searchTeams(q),
-        searchLeagues(q),
-      ]);
-      setCached(key, { teams, leagues }, SEARCH_TTL_MS);
-    } else {
-      console.log(`[api] sirviendo búsqueda "${q}" desde cache`);
-    }
+    const index = await getFreshTeamIndex();
 
-    res.json(getCached(key));
+    const teams = index
+      .filter((t) => t.name.toLowerCase().includes(q))
+      .slice(0, 15)
+      .map((t) => ({
+        id: t.id,
+        name: t.name,
+        country: t.leagueName,
+        crest: t.crest,
+      }));
+
+    const leagues = LEAGUES.filter((l) =>
+      l.name.toLowerCase().includes(q)
+    ).map((l) => ({ id: l.slug, name: l.name, country: null, logo: null }));
+
+    res.json({ teams, leagues });
   } catch (err) {
     console.error("[api] error search:", err.message);
-    res.status(502).json({ error: "No se pudo buscar en la API externa" });
+    res.status(502).json({ error: "No se pudo buscar (falló ESPN)" });
   }
 });
 
-// GET /api/teams/:id -> ficha del equipo: info, plantel, últimos partidos.
+// GET /api/teams/:id -> ficha del equipo.
 app.get("/api/teams/:id", async (req, res) => {
   const { id } = req.params;
   const key = `team:${id}`;
 
   try {
     if (isExpired(key)) {
-      console.log(`[api] pidiendo ficha del equipo ${id} a la API externa...`);
-      const profile = await fetchTeamProfile(id);
+      const index = await getFreshTeamIndex();
+      const entry = index.find((t) => String(t.id) === String(id));
+      if (!entry) {
+        return res.status(404).json({ error: "Equipo no encontrado" });
+      }
+
+      console.log(`[api] pidiendo ficha del equipo ${id} a ESPN...`);
+      const profile = await fetchTeamProfile(id, entry.leagueSlug);
       setCached(key, profile, TEAM_PROFILE_TTL_MS);
     } else {
       console.log(`[api] sirviendo ficha del equipo ${id} desde cache`);
@@ -112,12 +129,8 @@ app.get("/api/teams/:id", async (req, res) => {
   } catch (err) {
     console.error("[api] error team profile:", err.message);
     const stale = getCached(key);
-    if (stale) {
-      return res.json({ ...stale, stale: true });
-    }
-    res
-      .status(502)
-      .json({ error: "No se pudo obtener el equipo de la API externa" });
+    if (stale) return res.json({ ...stale, stale: true });
+    res.status(502).json({ error: "No se pudo obtener el equipo de ESPN" });
   }
 });
 
