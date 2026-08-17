@@ -270,6 +270,28 @@ async function fetchLeagueMatches(leagueSlug, leagueName, daysPast = 7, daysFutu
 
 
 
+// Arma el lado (local o visitante) de una alineación a partir de la
+// entrada de "rosters" que devuelve ESPN en /summary. Se usa tanto para
+// la alineación en vivo de la ficha de equipo como para el detalle de
+// partido.
+function buildLineupSide(rosterEntry) {
+  if (!rosterEntry) return null;
+  const starters = (rosterEntry.roster || [])
+    .filter((p) => p.starter)
+    .map((p) => ({
+      id: p.athlete?.id,
+      name: p.athlete?.displayName || p.athlete?.shortName,
+      number: p.jersey ? Number(p.jersey) : null,
+      position: p.position?.abbreviation || null,
+    }));
+  return {
+    teamId: rosterEntry.team?.id,
+    teamName: rosterEntry.team?.displayName,
+    formation: rosterEntry.formation?.name || null,
+    starters,
+  };
+}
+
 // Si el equipo tiene un partido jugándose AHORA MISMO, trae la alineación
 // titular de ambos equipos para ese partido. Si no hay partido en vivo,
 // devuelve null (el frontend simplemente no muestra esa sección).
@@ -293,26 +315,8 @@ async function fetchLiveLineup(teamId, leagueSlug) {
     const rosters = summary.rosters;
     if (!Array.isArray(rosters)) return null;
 
-    const buildSide = (rosterEntry) => {
-      if (!rosterEntry) return null;
-      const starters = (rosterEntry.roster || [])
-        .filter((p) => p.starter)
-        .map((p) => ({
-          id: p.athlete?.id,
-          name: p.athlete?.displayName || p.athlete?.shortName,
-          number: p.jersey ? Number(p.jersey) : null,
-          position: p.position?.abbreviation || null,
-        }));
-      return {
-        teamId: rosterEntry.team?.id,
-        teamName: rosterEntry.team?.displayName,
-        formation: rosterEntry.formation?.name || null,
-        starters,
-      };
-    };
-
-    const home = buildSide(rosters.find((r) => r.homeAway === "home"));
-    const away = buildSide(rosters.find((r) => r.homeAway === "away"));
+    const home = buildLineupSide(rosters.find((r) => r.homeAway === "home"));
+    const away = buildLineupSide(rosters.find((r) => r.homeAway === "away"));
 
     if (!home?.starters?.length && !away?.starters?.length) return null;
 
@@ -323,9 +327,117 @@ async function fetchLiveLineup(teamId, leagueSlug) {
   }
 }
 
+// Nombres candidatos para cada stat de las estadísticas de PARTIDO (no
+// confundir con STAT_ALIASES, que es para la tabla de posiciones — son
+// endpoints distintos con nombres de campo distintos).
+const MATCH_STAT_LABELS = {
+  possessionPct: "Posesión",
+  shotsTotal: "Remates",
+  shotsOnTarget: "Remates al arco",
+  wonCorners: "Córners",
+  foulsCommitted: "Faltas",
+  yellowCards: "Tarjetas amarillas",
+  redCards: "Tarjetas rojas",
+  saves: "Atajadas",
+  offsides: "Offsides",
+};
+
+function normalizeStatName(name) {
+  return (name || "").toLowerCase().replace(/[^a-z]/g, "");
+}
+
+// Extrae las estadísticas de UN partido puntual (posesión, remates,
+// córners, etc.) del boxscore de ESPN. Devuelve null si el partido
+// todavía no arrancó (no hay estadísticas de un partido que no se jugó).
+function extractMatchStatistics(boxscore) {
+  const teams = boxscore?.teams;
+  if (!Array.isArray(teams) || teams.length < 2) return null;
+
+  const home = teams.find((t) => t.homeAway === "home");
+  const away = teams.find((t) => t.homeAway === "away");
+  if (!home || !away) return null;
+
+  const rows = [];
+  for (const homeStat of home.statistics || []) {
+    const key = normalizeStatName(homeStat.name);
+    const label =
+      Object.entries(MATCH_STAT_LABELS).find(
+        ([k]) => normalizeStatName(k) === key
+      )?.[1] || homeStat.displayName || homeStat.label || homeStat.name;
+
+    const awayStat = away.statistics?.find(
+      (s) => normalizeStatName(s.name) === key
+    );
+
+    rows.push({
+      label,
+      home: homeStat.displayValue ?? homeStat.value ?? null,
+      away: awayStat?.displayValue ?? awayStat?.value ?? null,
+    });
+  }
+
+  return rows.length > 0 ? rows : null;
+}
+
+// Detalle completo de UN partido: estado, resultado, estadísticas (si ya
+// arrancó) y alineación. Si el partido todavía no arrancó, la alineación
+// que trae ESPN (si trae alguna) es la PROBABLE, no la confirmada — el
+// frontend es el que decide cómo rotular esto según el status.
+async function fetchMatchDetail(matchId, leagueSlug) {
+  const summary = await apiGet(
+    `${SITE_BASE}/${leagueSlug}/summary?event=${matchId}`
+  );
+
+  const competition = summary.header?.competitions?.[0];
+  const state = competition?.status?.type?.state;
+  const status = statusFromApi(state);
+
+  const home = pickCompetitor(competition?.competitors || [], "home");
+  const away = pickCompetitor(competition?.competitors || [], "away");
+
+  const statistics = status === "scheduled" ? null : extractMatchStatistics(summary.boxscore);
+
+  const rosters = summary.rosters;
+  let lineups = null;
+  if (Array.isArray(rosters)) {
+    const homeLineup = buildLineupSide(rosters.find((r) => r.homeAway === "home"));
+    const awayLineup = buildLineupSide(rosters.find((r) => r.homeAway === "away"));
+    if (homeLineup?.starters?.length || awayLineup?.starters?.length) {
+      lineups = { home: homeLineup, away: awayLineup };
+    }
+  }
+
+  return {
+    id: matchId,
+    status,
+    home: home
+      ? {
+          id: home.team.id,
+          name: home.team.displayName,
+          crest: home.team.logo || null,
+          score: status === "scheduled" ? null : Number(home.score),
+        }
+      : null,
+    away: away
+      ? {
+          id: away.team.id,
+          name: away.team.displayName,
+          crest: away.team.logo || null,
+          score: status === "scheduled" ? null : Number(away.score),
+        }
+      : null,
+    start: competition?.date || null,
+    statistics,
+    lineups,
+    // true si lineups viene de un partido que TODAVÍA no arrancó — en ese
+    // caso, si ESPN trajo algo, es una probable formación, no la final.
+    lineupsAreProbable: status === "scheduled",
+  };
+}
+
 // Ficha de equipo: info básica + estadísticas de tabla + plantel + últimos
 // partidos jugados + alineación en vivo (si aplica).
-async function fetchTeamProfile(teamId, leagueSlug) {
+async function fetchTeamProfile(teamId, leagueSlug, leagueName) {
   const [infoRes, rosterRes, scheduleRes, stats, liveLineup] = await Promise.all([
     apiGet(`${SITE_BASE}/${leagueSlug}/teams/${teamId}`),
     apiGet(`${SITE_BASE}/${leagueSlug}/teams/${teamId}/roster`),
@@ -393,6 +505,8 @@ async function fetchTeamProfile(teamId, leagueSlug) {
     country: null, // ESPN no siempre lo da a nivel equipo; el país ya se infiere de la liga
     founded: null,
     crest: team.logos?.[0]?.href || null,
+    leagueSlug,
+    leagueName,
     venue: team.venue
       ? {
           name: team.venue.fullName || null,
@@ -414,5 +528,6 @@ module.exports = {
   fetchTeamProfile,
   fetchLeagueStandings,
   fetchLeagueMatches,
+  fetchMatchDetail,
   LEAGUES,
 };
