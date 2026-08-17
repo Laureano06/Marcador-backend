@@ -57,11 +57,17 @@ Probar: `curl "http://localhost:3001/api/matches?date=2026-08-16"`
 
 - `GET /api/matches?date=YYYY-MM-DD`
 - `GET /api/search?q=boca` → busca sobre el índice de equipos cacheado
-- `GET /api/teams/:id` → ficha del equipo: info, cancha, **estadísticas de
-  tabla** (posición, PJ/PG/PE/PP, goles, puntos — `null` si la competencia
-  no tiene fase de tabla, como una copa eliminatoria), plantel, últimos 5
-  partidos jugados, y **alineación en vivo** (`null` salvo que el equipo
-  tenga un partido jugándose en ese momento)
+- `GET /api/teams/:id` → ficha del equipo: info, cancha, estadísticas de
+  tabla, plantel, últimos 5 partidos jugados, y alineación en vivo si
+  aplica
+- `GET /api/leagues` → lista fija de ligas (no pega contra ESPN)
+- `GET /api/leagues/:slug/standings` → tabla de posiciones completa de
+  esa liga (`{ standings: [...] }`, o `{ standings: null }` si la
+  competencia no tiene fase de tabla, como una copa eliminatoria).
+  Cacheada 30 min.
+- `GET /api/leagues/:slug/matches` → partidos de esa liga en una ventana
+  de ~3 semanas (7 días atrás, 14 adelante), independiente del día
+  seleccionado en el feed principal. Cacheada 10 min.
 - `GET /health`
 
 ## Lo más frágil de todo (leer antes de tocar `dataSource.js`)

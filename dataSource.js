@@ -162,13 +162,10 @@ function statusIsLive(state) {
   return state === "in";
 }
 
-// Busca las estadísticas de tabla del equipo (posición, PJ, PG, PE, PP,
-// goles a favor/en contra, puntos) en la tabla de posiciones de su liga.
-// ESPN no documenta oficialmente el nombre exacto de cada stat, así que
-// buscamos por una lista de nombres candidatos por métrica — si algún día
-// ESPN cambia el nombre de un campo, esto sigue funcionando mientras el
-// nuevo nombre esté en la lista (o se agrega acá, es el único lugar que
-// hay que tocar).
+// Nombres candidatos por métrica, porque ESPN no documenta oficialmente
+// cómo se llama cada stat en /standings. Si algún día ESPN cambia el
+// nombre de un campo, esto sigue funcionando mientras el nuevo nombre
+// esté en la lista (o se agrega acá, es el único lugar que hay que tocar).
 const STAT_ALIASES = {
   played: ["gamesplayed", "gp"],
   wins: ["wins", "w"],
@@ -188,46 +185,90 @@ function findStat(statsArray, aliases) {
   return stat ? Number(stat.value) : null;
 }
 
-async function fetchTeamStats(teamId, leagueSlug) {
+function parseStandingsEntry(entry) {
+  const stats = entry.stats;
+  return {
+    teamId: entry.team?.id,
+    teamName: entry.team?.displayName,
+    crest: entry.team?.logos?.[0]?.href || null,
+    rank: findStat(stats, STAT_ALIASES.rank),
+    played: findStat(stats, STAT_ALIASES.played),
+    wins: findStat(stats, STAT_ALIASES.wins),
+    draws: findStat(stats, STAT_ALIASES.draws),
+    losses: findStat(stats, STAT_ALIASES.losses),
+    goalsFor: findStat(stats, STAT_ALIASES.goalsFor),
+    goalsAgainst: findStat(stats, STAT_ALIASES.goalsAgainst),
+    points: findStat(stats, STAT_ALIASES.points),
+  };
+}
+
+// Trae la tabla de posiciones COMPLETA de una liga. Algunas competencias
+// vienen con varios grupos (ej. fase de grupos de un mundial) — en ese
+// caso concatenamos todos los grupos en una sola lista. Devuelve null si
+// la competencia no tiene tabla (ej. una copa eliminatoria).
+async function fetchLeagueStandings(leagueSlug) {
   try {
     const data = await apiGet(
       `https://site.api.espn.com/apis/v2/sports/soccer/${leagueSlug}/standings`
     );
 
-    // La tabla puede venir plana (entries) o agrupada (children/groups),
-    // según la competencia. Buscamos en ambos lugares.
     const groups = data.children || data.groups || [data];
-    let entry = null;
+    const rows = [];
     for (const g of groups) {
-      const found = (g.standings?.entries || []).find(
-        (e) => String(e.team?.id) === String(teamId)
-      );
-      if (found) {
-        entry = found;
-        break;
+      for (const entry of g.standings?.entries || []) {
+        rows.push(parseStandingsEntry(entry));
       }
     }
-    if (!entry) return null;
 
-    const stats = entry.stats;
-    return {
-      rank: findStat(stats, STAT_ALIASES.rank),
-      played: findStat(stats, STAT_ALIASES.played),
-      wins: findStat(stats, STAT_ALIASES.wins),
-      draws: findStat(stats, STAT_ALIASES.draws),
-      losses: findStat(stats, STAT_ALIASES.losses),
-      goalsFor: findStat(stats, STAT_ALIASES.goalsFor),
-      goalsAgainst: findStat(stats, STAT_ALIASES.goalsAgainst),
-      points: findStat(stats, STAT_ALIASES.points),
-    };
+    if (rows.length === 0) return null;
+
+    // Ordenamos por posición si la tenemos, si no por puntos.
+    rows.sort((a, b) => {
+      if (a.rank != null && b.rank != null) return a.rank - b.rank;
+      return (b.points || 0) - (a.points || 0);
+    });
+
+    return rows;
   } catch (err) {
-    // La tabla de posiciones no está disponible para todas las
-    // competencias (ej: copas eliminatorias sin fase de grupos). No es un
-    // error real, simplemente no hay estadísticas de tabla para mostrar.
-    console.error("[dataSource] no se pudo obtener stats de tabla:", err.message);
+    console.error(
+      `[dataSource] no se pudo obtener tabla de ${leagueSlug}:`,
+      err.message
+    );
     return null;
   }
 }
+
+async function fetchTeamStats(teamId, leagueSlug) {
+  const table = await fetchLeagueStandings(leagueSlug);
+  if (!table) return null;
+  const entry = table.find((e) => String(e.teamId) === String(teamId));
+  return entry || null;
+}
+
+function isoDateOnly(d) {
+  return d.toISOString().slice(0, 10).replace(/-/g, "");
+}
+
+// Partidos de UNA liga puntual, en una ventana de fechas (por default,
+// una semana para atrás y dos para adelante). Un solo request con rango
+// de fechas, en vez de pedir día por día.
+async function fetchLeagueMatches(leagueSlug, leagueName, daysPast = 7, daysFuture = 14) {
+  const today = new Date();
+  const from = new Date(today);
+  from.setDate(from.getDate() - daysPast);
+  const to = new Date(today);
+  to.setDate(to.getDate() + daysFuture);
+
+  const range = `${isoDateOnly(from)}-${isoDateOnly(to)}`;
+  const data = await apiGet(`${SITE_BASE}/${leagueSlug}/scoreboard?dates=${range}`);
+
+  return (data.events || [])
+    .map((event) => normalizeEvent(event, leagueName, leagueSlug))
+    .filter(Boolean)
+    .sort((a, b) => a.start.localeCompare(b.start));
+}
+
+
 
 // Si el equipo tiene un partido jugándose AHORA MISMO, trae la alineación
 // titular de ambos equipos para ese partido. Si no hay partido en vivo,
@@ -371,5 +412,7 @@ module.exports = {
   fetchMatchesForDate,
   buildTeamIndex,
   fetchTeamProfile,
+  fetchLeagueStandings,
+  fetchLeagueMatches,
   LEAGUES,
 };
