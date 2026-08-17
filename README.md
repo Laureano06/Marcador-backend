@@ -68,6 +68,12 @@ Probar: `curl "http://localhost:3001/api/matches?date=2026-08-16"`
 - `GET /api/leagues/:slug/matches` → partidos de esa liga en una ventana
   de ~3 semanas (7 días atrás, 14 adelante), independiente del día
   seleccionado en el feed principal. Cacheada 10 min.
+- `GET /api/matches/:id?league=slug` → detalle de UN partido: estado,
+  resultado, estadísticas (posesión, remates, córners, etc. — `null` si
+  todavía no arrancó) y alineación titular. Si el partido no arrancó
+  todavía, `lineupsAreProbable: true` avisa que la alineación (si hay) es
+  probable, no confirmada. Cacheada 2 min (los datos en vivo cambian
+  rápido).
 - `GET /health`
 
 ## Lo más frágil de todo (leer antes de tocar `dataSource.js`)

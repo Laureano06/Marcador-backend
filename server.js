@@ -7,6 +7,7 @@ const {
   fetchTeamProfile,
   fetchLeagueStandings,
   fetchLeagueMatches,
+  fetchMatchDetail,
   LEAGUES,
 } = require("./dataSource");
 const { getCached, getCachedMeta, setCached, isExpired } = require("./cache");
@@ -19,6 +20,7 @@ const TEAM_INDEX_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
 const STANDINGS_TTL_MS = 30 * 60 * 1000; // 30 min
 const LEAGUE_MATCHES_TTL_MS = 10 * 60 * 1000; // 10 min
+const MATCH_DETAIL_TTL_MS = 2 * 60 * 1000; // 2 min — datos en vivo cambian rápido
 
 const TEAM_INDEX_KEY = "team-index";
 
@@ -123,7 +125,7 @@ app.get("/api/teams/:id", async (req, res) => {
       }
 
       console.log(`[api] pidiendo ficha del equipo ${id} a ESPN...`);
-      const profile = await fetchTeamProfile(id, entry.leagueSlug);
+      const profile = await fetchTeamProfile(id, entry.leagueSlug, entry.leagueName);
       setCached(key, profile, TEAM_PROFILE_TTL_MS);
     } else {
       console.log(`[api] sirviendo ficha del equipo ${id} desde cache`);
@@ -208,6 +210,37 @@ app.get("/api/leagues/:slug/matches", async (req, res) => {
       });
     }
     res.status(502).json({ error: "No se pudo obtener partidos de ESPN" });
+  }
+});
+
+// GET /api/matches/:id?league=slug -> detalle de un partido puntual:
+// estado, resultado, estadísticas (si ya arrancó) y alineación (real o
+// probable según corresponda).
+app.get("/api/matches/:id", async (req, res) => {
+  const { id } = req.params;
+  const { league } = req.query;
+
+  if (!league) {
+    return res.status(400).json({ error: "Falta el parámetro ?league=slug" });
+  }
+
+  const key = `match-detail:${league}:${id}`;
+
+  try {
+    if (isExpired(key)) {
+      console.log(`[api] pidiendo detalle del partido ${id} a ESPN...`);
+      const detail = await fetchMatchDetail(id, league);
+      setCached(key, detail, MATCH_DETAIL_TTL_MS);
+    } else {
+      console.log(`[api] sirviendo detalle del partido ${id} desde cache`);
+    }
+
+    res.json(getCached(key));
+  } catch (err) {
+    console.error("[api] error match detail:", err.message);
+    const stale = getCached(key);
+    if (stale) return res.json({ ...stale, stale: true });
+    res.status(502).json({ error: "No se pudo obtener el partido de ESPN" });
   }
 });
 
