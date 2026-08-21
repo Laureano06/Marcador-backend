@@ -3,246 +3,212 @@ const express = require("express");
 const cors = require("cors");
 const {
   fetchMatchesForDate,
-  buildTeamIndex,
-  fetchTeamProfile,
+  searchTeams,
+  searchLeagues,
+  resolveLeagueId,
   fetchLeagueStandings,
   fetchLeagueMatches,
+  fetchTeamProfile,
   fetchMatchDetail,
   LEAGUES,
 } = require("./dataSource");
 const { getCached, getCachedMeta, setCached, isExpired } = require("./cache");
+const { getUsage, QuotaExceededError } = require("./quotaGuard");
 
 const app = express();
 app.use(cors());
 
-const MATCHES_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60 * 1000); // 5 min
-const TEAM_INDEX_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
+// TTLs pensados para el límite de 100 requests/día. Cuanto más caro es un
+// dato de conseguir (o más lento cambia), más tiempo lo reutilizamos.
+const MATCHES_TTL_MS = 20 * 60 * 1000; // 20 min — un día completo cuesta 1 sola request
+const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
-const STANDINGS_TTL_MS = 30 * 60 * 1000; // 30 min
-const LEAGUE_MATCHES_TTL_MS = 10 * 60 * 1000; // 10 min
-const MATCH_DETAIL_TTL_MS = 2 * 60 * 1000; // 2 min — datos en vivo cambian rápido
+const STANDINGS_TTL_MS = 2 * 60 * 60 * 1000; // 2 hs
+const LEAGUE_MATCHES_TTL_MS = 30 * 60 * 1000; // 30 min
+const MATCH_DETAIL_TTL_MS = 2 * 60 * 1000; // 2 min — vivo cambia rápido
+const LEAGUE_ID_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 días — esto no cambia nunca
 
-const TEAM_INDEX_KEY = "team-index";
-
-// Se asegura de que el índice de equipos esté fresco, y lo devuelve.
-// Un solo lugar que arma el índice, lo usan tanto /api/search como
-// /api/teams/:id (para saber en qué liga buscar el plantel).
-async function getFreshTeamIndex() {
-  if (isExpired(TEAM_INDEX_KEY)) {
-    console.log("[api] reconstruyendo índice de equipos...");
-    const index = await buildTeamIndex();
-    setCached(TEAM_INDEX_KEY, index, TEAM_INDEX_TTL_MS);
+function handleError(res, err, fallback) {
+  if (err instanceof QuotaExceededError) {
+    console.warn("[api] cuota agotada:", err.message);
+    return res.status(503).json({ error: err.message, quotaExceeded: true });
   }
-  return getCached(TEAM_INDEX_KEY);
+  console.error("[api] error:", err.message);
+  if (fallback) return res.json(fallback);
+  res.status(502).json({ error: "No se pudo obtener datos de API-Football" });
+}
+
+// Resuelve (y cachea casi para siempre) el ID numérico de una liga
+// configurada. Devuelve null si no se pudo resolver, sin tirar error —
+// el llamador decide qué hacer con eso.
+async function getLeagueId(league) {
+  const key = `league-id:${league.slug}`;
+  if (isExpired(key)) {
+    const id = await resolveLeagueId(league);
+    if (id) setCached(key, id, LEAGUE_ID_TTL_MS);
+    return id;
+  }
+  return getCached(key);
 }
 
 // GET /api/matches?date=2026-08-16
 app.get("/api/matches", async (req, res) => {
   const { date } = req.query;
   if (!date) {
-    return res
-      .status(400)
-      .json({ error: "Falta el parámetro ?date=YYYY-MM-DD" });
+    return res.status(400).json({ error: "Falta el parámetro ?date=YYYY-MM-DD" });
   }
 
   const key = `matches:${date}`;
-
   try {
     if (isExpired(key)) {
-      console.log(`[api] pidiendo partidos de ${date} a ESPN...`);
+      console.log(`[api] pidiendo partidos de ${date} a API-Football...`);
       const matches = await fetchMatchesForDate(date);
       setCached(key, matches, MATCHES_TTL_MS);
     } else {
       console.log(`[api] sirviendo partidos de ${date} desde cache`);
     }
-
     const meta = getCachedMeta(key);
-    res.json({
-      updatedAt: new Date(meta.updatedAt).toISOString(),
-      matches: meta.data,
-    });
+    res.json({ updatedAt: new Date(meta.updatedAt).toISOString(), matches: meta.data });
   } catch (err) {
-    console.error("[api] error matches:", err.message);
     const stale = getCachedMeta(key);
-    if (stale) {
-      return res.json({
+    handleError(
+      res,
+      err,
+      stale && {
         updatedAt: new Date(stale.updatedAt).toISOString(),
         matches: stale.data,
         stale: true,
-      });
-    }
-    res.status(502).json({ error: "No se pudo obtener partidos de ESPN" });
+      }
+    );
   }
 });
 
 // GET /api/search?q=boca
-// Filtra sobre el índice de equipos ya cacheado (no gasta requests nuevas
-// contra ESPN en cada búsqueda) + la lista fija de ligas.
 app.get("/api/search", async (req, res) => {
-  const q = (req.query.q || "").trim().toLowerCase();
-
+  const q = (req.query.q || "").trim();
   if (q.length < 3) {
-    return res
-      .status(400)
-      .json({ error: "La búsqueda necesita al menos 3 caracteres" });
+    return res.status(400).json({ error: "La búsqueda necesita al menos 3 caracteres" });
   }
 
+  const key = `search:${q.toLowerCase()}`;
   try {
-    const index = await getFreshTeamIndex();
-
-    const teams = index
-      .filter((t) => t.name.toLowerCase().includes(q))
-      .slice(0, 15)
-      .map((t) => ({
-        id: t.id,
-        name: t.name,
-        country: t.leagueName,
-        crest: t.crest,
-      }));
-
-    const leagues = LEAGUES.filter((l) =>
-      l.name.toLowerCase().includes(q)
-    ).map((l) => ({ id: l.slug, name: l.name, country: null, logo: null }));
-
-    res.json({ teams, leagues });
+    if (isExpired(key)) {
+      console.log(`[api] buscando "${q}" en API-Football...`);
+      const teams = await searchTeams(q);
+      const leagues = searchLeagues(q); // no gasta requests
+      setCached(key, { teams, leagues }, SEARCH_TTL_MS);
+    } else {
+      console.log(`[api] sirviendo búsqueda "${q}" desde cache`);
+    }
+    res.json(getCached(key));
   } catch (err) {
-    console.error("[api] error search:", err.message);
-    res.status(502).json({ error: "No se pudo buscar (falló ESPN)" });
+    handleError(res, err);
   }
 });
 
-// GET /api/teams/:id -> ficha del equipo.
+// GET /api/teams/:id
 app.get("/api/teams/:id", async (req, res) => {
   const { id } = req.params;
   const key = `team:${id}`;
-
   try {
     if (isExpired(key)) {
-      const index = await getFreshTeamIndex();
-      const entry = index.find((t) => String(t.id) === String(id));
-      if (!entry) {
-        return res.status(404).json({ error: "Equipo no encontrado" });
-      }
-
-      console.log(`[api] pidiendo ficha del equipo ${id} a ESPN...`);
-      const profile = await fetchTeamProfile(id, entry.leagueSlug, entry.leagueName);
+      console.log(`[api] pidiendo ficha del equipo ${id} a API-Football...`);
+      const profile = await fetchTeamProfile(id);
       setCached(key, profile, TEAM_PROFILE_TTL_MS);
     } else {
       console.log(`[api] sirviendo ficha del equipo ${id} desde cache`);
     }
-
     res.json(getCached(key));
   } catch (err) {
-    console.error("[api] error team profile:", err.message);
     const stale = getCached(key);
-    if (stale) return res.json({ ...stale, stale: true });
-    res.status(502).json({ error: "No se pudo obtener el equipo de ESPN" });
+    handleError(res, err, stale && { ...stale, stale: true });
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// GET /api/leagues -> lista fija de ligas (para el panel de navegación).
-// No pega contra ESPN, es la lista que configuramos en dataSource.js.
+// GET /api/leagues -> lista fija, no gasta requests.
 app.get("/api/leagues", (_req, res) => {
-  res.json(LEAGUES);
+  res.json(LEAGUES.map(({ slug, name }) => ({ slug, name })));
 });
 
-// GET /api/leagues/:slug/standings -> tabla de posiciones completa.
+// GET /api/leagues/:slug/standings
 app.get("/api/leagues/:slug/standings", async (req, res) => {
   const { slug } = req.params;
-  const key = `standings:${slug}`;
+  const league = LEAGUES.find((l) => l.slug === slug);
+  if (!league) return res.status(404).json({ error: "Liga no encontrada" });
 
+  const key = `standings:${slug}`;
   try {
     if (isExpired(key)) {
-      console.log(`[api] pidiendo tabla de ${slug} a ESPN...`);
-      const table = await fetchLeagueStandings(slug);
-      setCached(key, table, STANDINGS_TTL_MS);
+      const leagueId = await getLeagueId(league);
+      if (!leagueId) {
+        setCached(key, null, STANDINGS_TTL_MS);
+      } else {
+        console.log(`[api] pidiendo tabla de ${slug} a API-Football...`);
+        const table = await fetchLeagueStandings(leagueId);
+        setCached(key, table, STANDINGS_TTL_MS);
+      }
     } else {
       console.log(`[api] sirviendo tabla de ${slug} desde cache`);
     }
-
-    const table = getCached(key);
-    // table puede ser null legítimamente (competencia sin fase de tabla,
-    // ej. una copa eliminatoria) — no es un error, se lo avisamos así al
-    // frontend para que no muestre un cartel de error por las dudas.
-    res.json({ standings: table });
+    res.json({ standings: getCached(key) });
   } catch (err) {
-    console.error("[api] error standings:", err.message);
-    res.status(502).json({ error: "No se pudo obtener la tabla de ESPN" });
+    handleError(res, err);
   }
 });
 
-// GET /api/leagues/:slug/matches -> partidos de esa liga (una ventana de
-// ~3 semanas alrededor de hoy), independiente del día seleccionado en el
-// feed principal.
+// GET /api/leagues/:slug/matches
 app.get("/api/leagues/:slug/matches", async (req, res) => {
   const { slug } = req.params;
   const league = LEAGUES.find((l) => l.slug === slug);
-  if (!league) {
-    return res.status(404).json({ error: "Liga no encontrada" });
-  }
+  if (!league) return res.status(404).json({ error: "Liga no encontrada" });
 
   const key = `league-matches:${slug}`;
-
   try {
     if (isExpired(key)) {
-      console.log(`[api] pidiendo partidos de ${slug} a ESPN...`);
-      const matches = await fetchLeagueMatches(slug, league.name);
-      setCached(key, matches, LEAGUE_MATCHES_TTL_MS);
+      const leagueId = await getLeagueId(league);
+      if (!leagueId) {
+        setCached(key, [], LEAGUE_MATCHES_TTL_MS);
+      } else {
+        console.log(`[api] pidiendo partidos de ${slug} a API-Football...`);
+        const matches = await fetchLeagueMatches(leagueId);
+        setCached(key, matches, LEAGUE_MATCHES_TTL_MS);
+      }
     } else {
       console.log(`[api] sirviendo partidos de ${slug} desde cache`);
     }
-
     const meta = getCachedMeta(key);
-    res.json({
-      updatedAt: new Date(meta.updatedAt).toISOString(),
-      matches: meta.data,
-    });
+    res.json({ updatedAt: new Date(meta.updatedAt).toISOString(), matches: meta.data });
   } catch (err) {
-    console.error("[api] error league matches:", err.message);
-    const stale = getCachedMeta(key);
-    if (stale) {
-      return res.json({
-        updatedAt: new Date(stale.updatedAt).toISOString(),
-        matches: stale.data,
-        stale: true,
-      });
-    }
-    res.status(502).json({ error: "No se pudo obtener partidos de ESPN" });
+    handleError(res, err);
   }
 });
 
-// GET /api/matches/:id?league=slug -> detalle de un partido puntual:
-// estado, resultado, estadísticas (si ya arrancó) y alineación (real o
-// probable según corresponda).
+// GET /api/matches/:id -> detalle de un partido puntual (API-Football
+// resuelve todo por el ID del partido, no hace falta pasar la liga).
 app.get("/api/matches/:id", async (req, res) => {
   const { id } = req.params;
-  const { league } = req.query;
-
-  if (!league) {
-    return res.status(400).json({ error: "Falta el parámetro ?league=slug" });
-  }
-
-  const key = `match-detail:${league}:${id}`;
-
+  const key = `match-detail:${id}`;
   try {
     if (isExpired(key)) {
-      console.log(`[api] pidiendo detalle del partido ${id} a ESPN...`);
-      const detail = await fetchMatchDetail(id, league);
+      console.log(`[api] pidiendo detalle del partido ${id} a API-Football...`);
+      const detail = await fetchMatchDetail(id);
       setCached(key, detail, MATCH_DETAIL_TTL_MS);
     } else {
       console.log(`[api] sirviendo detalle del partido ${id} desde cache`);
     }
-
     res.json(getCached(key));
   } catch (err) {
-    console.error("[api] error match detail:", err.message);
     const stale = getCached(key);
-    if (stale) return res.json({ ...stale, stale: true });
-    res.status(502).json({ error: "No se pudo obtener el partido de ESPN" });
+    handleError(res, err, stale && { ...stale, stale: true });
   }
 });
+
+// GET /api/quota -> transparencia sobre cuánto llevamos gastado hoy.
+app.get("/api/quota", (_req, res) => {
+  res.json(getUsage());
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {

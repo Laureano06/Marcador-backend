@@ -1,42 +1,106 @@
 // Todo lo que sepa sobre "cómo habla la API externa" vive acá adentro.
-// Usamos la API pública de ESPN (site.api.espn.com) — NO requiere cuenta
-// ni API key. A cambio, no es oficial ni documentada por ESPN (la
-// comunidad la reversineó), así que puede cambiar sin aviso. Referencia:
-// https://github.com/pseudo-r/Public-ESPN-API
+// Usamos API-Football (dashboard.api-football.com) directo — header
+// "x-apisports-key" (NO es vía RapidAPI).
+//
+// Diseño pensado para el plan free (100 requests/día):
+// - El feed de partidos por día usa /fixtures?date=X, que trae TODAS las
+//   ligas del mundo en UNA sola llamada. Filtramos por país acá adentro,
+//   no le pedimos a la API liga por liga.
+// - La búsqueda de ligas es local (no gasta requests): filtramos nuestra
+//   propia lista fija.
+// - Lo único que necesita el ID numérico de liga de API-Football (tabla
+//   de posiciones, partidos de una liga puntual) lo resuelve una vez y
+//   lo cachea casi para siempre (90 días) — no lo volvemos a pedir.
+// - Cada llamada pasa por el "quota guard" (quotaGuard.js), que corta
+//   antes de llegar al límite diario.
 
-const SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer";
+const { canMakeRequest, recordRequest, QuotaExceededError } = require("./quotaGuard");
 
-// Ligas que mostramos, en el orden en que queremos que aparezcan. El slug
-// es el identificador que usa ESPN; el nombre es el que ve el usuario.
-// Para agregar/sacar una liga, agregá/sacá una línea acá — no hay que
-// tocar nada más del código.
-const LEAGUES = [
-  { slug: "arg.1", name: "Liga Profesional Argentina" },
-  { slug: "arg.copa", name: "Copa Argentina" },
-  { slug: "conmebol.libertadores", name: "Copa Libertadores" },
-  { slug: "conmebol.sudamericana", name: "Copa Sudamericana" },
-  { slug: "fifa.world", name: "Mundial" },
-  { slug: "uefa.champions", name: "UEFA Champions League" },
-  { slug: "eng.1", name: "Premier League" },
-  { slug: "esp.1", name: "La Liga" },
-  { slug: "ita.1", name: "Serie A" },
-  { slug: "ger.1", name: "Bundesliga" },
-  { slug: "fra.1", name: "Ligue 1" },
-  { slug: "por.1", name: "Primeira Liga" },
-  { slug: "ned.1", name: "Eredivisie" },
-  { slug: "bra.1", name: "Brasileirão" },
+const BASE_URL = "https://v3.football.api-sports.io";
+
+// Temporada "actual" para los endpoints que la piden (standings,
+// fixtures por liga). API-Football nombra la temporada por el año en que
+// arrancó (la 2026-27 europea es "2026"). Como el año calendario no
+// siempre coincide prolijamente con el arranque de cada torneo, dejamos
+// esto configurable por variable de entorno para no tener que tocar
+// código si hay que ajustarlo.
+const SEASON = Number(process.env.API_FOOTBALL_SEASON || new Date().getFullYear());
+
+// País por país, en vez de ID de liga por ID de liga — mucho más difícil
+// de arruinar (ver charla anterior sobre por qué). Cubre lo que se ve en
+// el feed principal de "todas las ligas".
+const INCLUDE_COUNTRIES = [
+  "Argentina",
+  "World",
+  "England",
+  "Spain",
+  "Italy",
+  "Germany",
+  "France",
+  "Brazil",
+  "Portugal",
+  "Netherlands",
 ];
 
-function statusFromApi(state) {
-  // ESPN usa status.type.state: "pre" | "in" | "post"
-  if (state === "in") return "live";
-  if (state === "post") return "final";
+// Ligas para el panel lateral / página de liga (tabla + partidos propios).
+// Estas SÍ necesitan un ID numérico de API-Football, que se resuelve la
+// primera vez que se pide cada una (ver resolveLeagueId) y se cachea
+// larguísimo desde server.js.
+const LEAGUES = [
+  { slug: "arg-liga-profesional", name: "Liga Profesional Argentina", country: "Argentina" },
+  { slug: "arg-copa", name: "Copa Argentina", country: "Argentina" },
+  { slug: "conmebol-libertadores", name: "Copa Libertadores", country: "World" },
+  { slug: "conmebol-sudamericana", name: "Copa Sudamericana", country: "World" },
+  { slug: "world-cup", name: "Mundial", country: "World" },
+  { slug: "uefa-champions", name: "UEFA Champions League", country: "World" },
+  { slug: "eng-premier", name: "Premier League", country: "England" },
+  { slug: "esp-laliga", name: "La Liga", country: "Spain" },
+  { slug: "ita-seriea", name: "Serie A", country: "Italy" },
+  { slug: "ger-bundesliga", name: "Bundesliga", country: "Germany" },
+  { slug: "fra-ligue1", name: "Ligue 1", country: "France" },
+  { slug: "por-primeira", name: "Primeira Liga", country: "Portugal" },
+  { slug: "ned-eredivisie", name: "Eredivisie", country: "Netherlands" },
+  { slug: "bra-serieA", name: "Brasileirão", country: "Brazil" },
+];
+
+async function apiGet(path) {
+  if (!canMakeRequest()) {
+    throw new QuotaExceededError();
+  }
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { "x-apisports-key": process.env.API_FOOTBALL_KEY },
+  });
+  recordRequest();
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`API-Football respondió ${res.status}: ${body}`);
+  }
+
+  const data = await res.json();
+
+  if (data.errors && Object.keys(data.errors).length > 0) {
+    throw new Error(`API-Football error: ${JSON.stringify(data.errors)}`);
+  }
+
+  return data.response || [];
+}
+
+function statusFromApi(shortCode) {
+  const LIVE = ["1H", "HT", "2H", "ET", "BT", "P", "LIVE"];
+  const FINISHED = ["FT", "AET", "PEN"];
+  const OFF = ["PST", "CANC", "ABD", "SUSP", "AWD", "WO"];
+
+  if (LIVE.includes(shortCode)) return "live";
+  if (FINISHED.includes(shortCode)) return "final";
+  if (OFF.includes(shortCode)) return "postponed";
   return "scheduled";
 }
 
 function abbreviate(name) {
   return name
-    .replace(/FC|CF|AFC|United|City|Club/gi, "")
+    .replace(/FC|CF|AFC|United|City|Club|Atlético|Atletico/gi, "")
     .trim()
     .split(" ")
     .filter(Boolean)
@@ -46,548 +110,298 @@ function abbreviate(name) {
     .toUpperCase();
 }
 
-async function apiGet(url) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`ESPN respondió ${res.status} para ${url}`);
-  }
-  return res.json();
-}
-
-function pickCompetitor(competitors, side) {
-  return competitors.find((c) => c.homeAway === side);
-}
-
-// El campo del escudo viene con nombres distintos según el endpoint:
-// el scoreboard usa "logo" (string), pero /summary y otros a veces traen
-// "logos" (array de objetos {href}). Probamos ambos formatos acá, en un
-// solo lugar, para no repetir esta lógica en cada función.
-function getTeamLogo(team) {
-  if (!team) return null;
-  if (typeof team.logo === "string") return team.logo;
-  if (Array.isArray(team.logos) && team.logos[0]?.href) return team.logos[0].href;
-  return null;
-}
-
-// Convierte UN evento crudo del scoreboard de ESPN al shape que usa el
-// frontend.
-function normalizeEvent(event, leagueName, leagueSlug) {
-  const competition = event.competitions?.[0];
-  if (!competition) return null;
-
-  const home = pickCompetitor(competition.competitors, "home");
-  const away = pickCompetitor(competition.competitors, "away");
-  if (!home || !away) return null;
-
-  const state = competition.status?.type?.state;
-  const status = statusFromApi(state);
+function normalizeMatch(raw) {
+  const status = statusFromApi(raw.fixture.status.short);
   const hasScore = status !== "scheduled";
 
   return {
-    id: event.id,
-    league: leagueName,
-    leagueId: leagueSlug,
+    id: raw.fixture.id,
+    league: raw.league.name,
+    leagueId: raw.league.id,
+    leagueCountry: raw.league.country,
     status,
-    home: home.team.displayName,
-    homeId: home.team.id,
-    homeAb: home.team.abbreviation || abbreviate(home.team.displayName),
-    homeCrest: getTeamLogo(home.team),
-    away: away.team.displayName,
-    awayId: away.team.id,
-    awayAb: away.team.abbreviation || abbreviate(away.team.displayName),
-    awayCrest: getTeamLogo(away.team),
-    scoreHome: hasScore ? Number(home.score) : null,
-    scoreAway: hasScore ? Number(away.score) : null,
-    start: event.date,
-    // ESPN no da probabilidades en el scoreboard (existe un endpoint de
-    // "probabilities" por partido individual, pero pedirlo para cada
-    // partido de la lista sería carísimo en requests).
+    home: raw.teams.home.name,
+    homeId: raw.teams.home.id,
+    homeAb: abbreviate(raw.teams.home.name),
+    homeCrest: raw.teams.home.logo || null,
+    away: raw.teams.away.name,
+    awayId: raw.teams.away.id,
+    awayAb: abbreviate(raw.teams.away.name),
+    awayCrest: raw.teams.away.logo || null,
+    scoreHome: hasScore ? raw.goals.home ?? null : null,
+    scoreAway: hasScore ? raw.goals.away ?? null : null,
+    start: raw.fixture.date,
     prob: null,
   };
 }
 
-// YYYY-MM-DD -> YYYYMMDD (formato que espera ESPN)
-function toEspnDate(dateKey) {
-  return dateKey.replace(/-/g, "");
+// TODOS los partidos de TODAS las ligas para un día puntual, en UNA sola
+// llamada a la API. Es la joya de la corona de esta versión: el feed de
+// "todas las ligas disponibles" cuesta 1 request, no 14.
+async function fetchMatchesForDate(dateStr) {
+  const response = await apiGet(`/fixtures?date=${dateStr}`);
+
+  return response
+    .filter((raw) => INCLUDE_COUNTRIES.includes(raw.league.country))
+    .map(normalizeMatch)
+    .sort((a, b) => a.start.localeCompare(b.start));
 }
 
-// Trae los partidos de TODAS las ligas configuradas, para un día puntual.
-// Una request por liga, todas en paralelo.
-async function fetchMatchesForDate(dateKey) {
-  const espnDate = toEspnDate(dateKey);
+// Busca equipos por nombre. 1 request por texto de búsqueda (se cachea
+// por texto desde server.js).
+async function searchTeams(query) {
+  const response = await apiGet(`/teams?search=${encodeURIComponent(query)}`);
+  return response.map((item) => ({
+    id: item.team.id,
+    name: item.team.name,
+    country: item.team.country,
+    crest: item.team.logo || null,
+  }));
+}
 
-  const results = await Promise.allSettled(
-    LEAGUES.map(async ({ slug, name }) => {
-      const data = await apiGet(
-        `${SITE_BASE}/${slug}/scoreboard?dates=${espnDate}`
-      );
-      return (data.events || [])
-        .map((event) => normalizeEvent(event, name, slug))
-        .filter(Boolean);
-    })
+// Búsqueda de ligas: NO gasta requests — filtra nuestra propia lista fija.
+function searchLeagues(query) {
+  const q = query.toLowerCase();
+  return LEAGUES.filter((l) => l.name.toLowerCase().includes(q)).map((l) => ({
+    id: l.slug,
+    name: l.name,
+    country: l.country,
+    logo: null,
+  }));
+}
+
+// Resuelve el ID numérico de API-Football para una de nuestras ligas
+// configuradas (por nombre + país). Se llama UNA vez por liga — el
+// resultado se cachea larguísimo desde server.js, así que en la práctica
+// esto se paga una sola vez por liga, para siempre.
+async function resolveLeagueId(league) {
+  const response = await apiGet(
+    `/leagues?country=${encodeURIComponent(league.country === "World" ? "" : league.country)}&search=${encodeURIComponent(league.name)}`
   );
 
-  const matches = [];
-  for (const r of results) {
-    // Si una liga puntual falla (por ej. ESPN no tiene datos para esa
-    // liga ese día), no tiramos abajo toda la respuesta — mostramos las
-    // demás ligas igual.
-    if (r.status === "fulfilled") matches.push(...r.value);
-    else console.error("[dataSource] falló una liga:", r.reason?.message);
-  }
-
-  return matches.sort((a, b) => a.start.localeCompare(b.start));
-}
-
-// Trae la lista de equipos de TODAS las ligas configuradas, para armar el
-// índice de búsqueda. Se cachea 24hs desde server.js — los planteles de
-// equipos no cambian de un día para el otro.
-async function buildTeamIndex() {
-  const results = await Promise.allSettled(
-    LEAGUES.map(async ({ slug, name }) => {
-      const data = await apiGet(`${SITE_BASE}/${slug}/teams`);
-      const teams = data.sports?.[0]?.leagues?.[0]?.teams || [];
-      return teams.map((t) => ({
-        id: t.team.id,
-        name: t.team.displayName,
-        crest: getTeamLogo(t.team),
-        leagueSlug: slug,
-        leagueName: name,
-      }));
-    })
-  );
-
-  const index = [];
-  for (const r of results) {
-    if (r.status === "fulfilled") index.push(...r.value);
-    else console.error("[dataSource] falló índice de una liga:", r.reason?.message);
-  }
-  return index;
-}
-
-function statusIsFinished(state) {
-  return state === "post";
-}
-
-function statusIsLive(state) {
-  return state === "in";
-}
-
-// Nombres candidatos por métrica, porque ESPN no documenta oficialmente
-// cómo se llama cada stat en /standings. Si algún día ESPN cambia el
-// nombre de un campo, esto sigue funcionando mientras el nuevo nombre
-// esté en la lista (o se agrega acá, es el único lugar que hay que tocar).
-const STAT_ALIASES = {
-  played: ["gamesplayed", "gp"],
-  wins: ["wins", "w"],
-  draws: ["ties", "draws", "d"],
-  losses: ["losses", "l"],
-  goalsFor: ["pointsfor", "goalsfor", "gf"],
-  goalsAgainst: ["pointsagainst", "goalsagainst", "ga"],
-  points: ["points", "pts"],
-  rank: ["rank"],
-};
-
-function findStat(statsArray, aliases) {
-  if (!Array.isArray(statsArray)) return null;
-  const stat = statsArray.find((s) =>
-    aliases.includes((s.name || s.abbreviation || "").toLowerCase())
-  );
-  return stat ? Number(stat.value) : null;
-}
-
-function parseStandingsEntry(entry) {
-  const stats = entry.stats;
-  return {
-    teamId: entry.team?.id,
-    teamName: entry.team?.displayName,
-    crest: getTeamLogo(entry.team),
-    rank: findStat(stats, STAT_ALIASES.rank),
-    played: findStat(stats, STAT_ALIASES.played),
-    wins: findStat(stats, STAT_ALIASES.wins),
-    draws: findStat(stats, STAT_ALIASES.draws),
-    losses: findStat(stats, STAT_ALIASES.losses),
-    goalsFor: findStat(stats, STAT_ALIASES.goalsFor),
-    goalsAgainst: findStat(stats, STAT_ALIASES.goalsAgainst),
-    points: findStat(stats, STAT_ALIASES.points),
-  };
-}
-
-// Trae la tabla de posiciones COMPLETA de una liga. Algunas competencias
-// vienen con varios grupos (ej. fase de grupos de un mundial) — en ese
-// caso concatenamos todos los grupos en una sola lista. Devuelve null si
-// la competencia no tiene tabla (ej. una copa eliminatoria).
-async function fetchLeagueStandings(leagueSlug) {
-  try {
-    const data = await apiGet(
-      `https://site.api.espn.com/apis/v2/sports/soccer/${leagueSlug}/standings`
-    );
-
-    const groups = data.children || data.groups || [data];
-    const rows = [];
-    for (const g of groups) {
-      for (const entry of g.standings?.entries || []) {
-        rows.push(parseStandingsEntry(entry));
-      }
-    }
-
-    if (rows.length === 0) return null;
-
-    // Ordenamos por posición si la tenemos, si no por puntos.
-    rows.sort((a, b) => {
-      if (a.rank != null && b.rank != null) return a.rank - b.rank;
-      return (b.points || 0) - (a.points || 0);
-    });
-
-    return rows;
-  } catch (err) {
+  if (response.length === 0) {
     console.error(
-      `[dataSource] no se pudo obtener tabla de ${leagueSlug}:`,
-      err.message
+      `[dataSource] no se encontró la liga "${league.name}" (${league.country}) en API-Football`
     );
+    return null;
+  }
+
+  // Preferimos una coincidencia de nombre exacta (insensible a mayúsculas);
+  // si no hay, nos quedamos con el primer resultado.
+  const exact = response.find(
+    (r) => r.league.name.toLowerCase() === league.name.toLowerCase()
+  );
+  const chosen = exact || response[0];
+
+  return chosen.league.id;
+}
+
+// Tabla de posiciones completa de una liga (ya resuelto su ID numérico).
+async function fetchLeagueStandings(leagueId) {
+  try {
+    const response = await apiGet(
+      `/standings?league=${leagueId}&season=${SEASON}`
+    );
+    const table = response[0]?.league?.standings?.[0];
+    if (!table) return null;
+
+    return table.map((row) => ({
+      teamId: row.team.id,
+      teamName: row.team.name,
+      crest: row.team.logo || null,
+      rank: row.rank,
+      played: row.all.played,
+      wins: row.all.win,
+      draws: row.all.draw,
+      losses: row.all.lose,
+      goalsFor: row.all.goals.for,
+      goalsAgainst: row.all.goals.against,
+      points: row.points,
+    }));
+  } catch (err) {
+    // Copas eliminatorias u otras competencias sin tabla de posiciones
+    // devuelven una respuesta vacía — no es un error real.
+    console.error(`[dataSource] no se pudo obtener tabla de liga ${leagueId}:`, err.message);
     return null;
   }
 }
 
-async function fetchTeamStats(teamId, leagueSlug) {
-  const table = await fetchLeagueStandings(leagueSlug);
-  if (!table) return null;
-  const entry = table.find((e) => String(e.teamId) === String(teamId));
-  return entry || null;
-}
-
-function isoDateOnly(d) {
-  return d.toISOString().slice(0, 10).replace(/-/g, "");
-}
-
-// Partidos de UNA liga puntual, en una ventana de fechas (por default,
-// una semana para atrás y dos para adelante). Un solo request con rango
-// de fechas, en vez de pedir día por día.
-async function fetchLeagueMatches(leagueSlug, leagueName, daysPast = 7, daysFuture = 14) {
+// Partidos de UNA liga en una ventana de fechas (para la pestaña
+// "Partidos" de la página de liga).
+async function fetchLeagueMatches(leagueId, daysPast = 7, daysFuture = 14) {
   const today = new Date();
   const from = new Date(today);
   from.setDate(from.getDate() - daysPast);
   const to = new Date(today);
   to.setDate(to.getDate() + daysFuture);
 
-  const range = `${isoDateOnly(from)}-${isoDateOnly(to)}`;
-  const data = await apiGet(`${SITE_BASE}/${leagueSlug}/scoreboard?dates=${range}`);
+  const iso = (d) => d.toISOString().slice(0, 10);
 
-  return (data.events || [])
-    .map((event) => normalizeEvent(event, leagueName, leagueSlug))
-    .filter(Boolean)
-    .sort((a, b) => a.start.localeCompare(b.start));
-}
-
-
-
-// Arma el lado (local o visitante) de una alineación a partir de la
-// entrada de "rosters" que devuelve ESPN en /summary. Se usa tanto para
-// la alineación en vivo de la ficha de equipo como para el detalle de
-// partido.
-function buildLineupSide(rosterEntry) {
-  if (!rosterEntry) return null;
-  const starters = (rosterEntry.roster || [])
-    .filter((p) => p.starter)
-    .map((p) => ({
-      id: p.athlete?.id,
-      name: p.athlete?.displayName || p.athlete?.shortName,
-      number: p.jersey ? Number(p.jersey) : null,
-      position: p.position?.abbreviation || null,
-    }));
-  return {
-    teamId: rosterEntry.team?.id,
-    teamName: rosterEntry.team?.displayName,
-    formation: rosterEntry.formation?.name || null,
-    starters,
-  };
-}
-
-// Si el equipo tiene un partido jugándose AHORA MISMO, trae la alineación
-// titular de ambos equipos para ese partido. Si no hay partido en vivo,
-// devuelve null (el frontend simplemente no muestra esa sección).
-async function fetchLiveLineup(teamId, leagueSlug) {
-  try {
-    const schedule = await apiGet(
-      `${SITE_BASE}/${leagueSlug}/teams/${teamId}/schedule`
-    );
-
-    const liveEvent = (schedule.events || []).find((event) => {
-      const state = event.competitions?.[0]?.status?.type?.state;
-      return statusIsLive(state);
-    });
-
-    if (!liveEvent) return null;
-
-    const summary = await apiGet(
-      `${SITE_BASE}/${leagueSlug}/summary?event=${liveEvent.id}`
-    );
-
-    const rosters = summary.rosters;
-    if (!Array.isArray(rosters)) return null;
-
-    const home = buildLineupSide(rosters.find((r) => r.homeAway === "home"));
-    const away = buildLineupSide(rosters.find((r) => r.homeAway === "away"));
-
-    if (!home?.starters?.length && !away?.starters?.length) return null;
-
-    return { matchId: liveEvent.id, home, away };
-  } catch (err) {
-    console.error("[dataSource] no se pudo obtener alineación en vivo:", err.message);
-    return null;
-  }
-}
-
-// Nombres candidatos para cada stat de las estadísticas de PARTIDO (no
-// confundir con STAT_ALIASES, que es para la tabla de posiciones — son
-// endpoints distintos con nombres de campo distintos).
-const MATCH_STAT_LABELS = {
-  possessionPct: "Posesión",
-  shotsTotal: "Remates",
-  shotsOnTarget: "Remates al arco",
-  wonCorners: "Córners",
-  foulsCommitted: "Faltas",
-  yellowCards: "Tarjetas amarillas",
-  redCards: "Tarjetas rojas",
-  saves: "Atajadas",
-  offsides: "Offsides",
-};
-
-function normalizeStatName(name) {
-  return (name || "").toLowerCase().replace(/[^a-z]/g, "");
-}
-
-// Extrae las estadísticas de UN partido puntual (posesión, remates,
-// córners, etc.) del boxscore de ESPN. Devuelve null si el partido
-// todavía no arrancó (no hay estadísticas de un partido que no se jugó).
-function extractMatchStatistics(boxscore) {
-  const teams = boxscore?.teams;
-  if (!Array.isArray(teams) || teams.length < 2) return null;
-
-  const home = teams.find((t) => t.homeAway === "home");
-  const away = teams.find((t) => t.homeAway === "away");
-  if (!home || !away) return null;
-
-  const rows = [];
-  for (const homeStat of home.statistics || []) {
-    const key = normalizeStatName(homeStat.name);
-    const label =
-      Object.entries(MATCH_STAT_LABELS).find(
-        ([k]) => normalizeStatName(k) === key
-      )?.[1] || homeStat.displayName || homeStat.label || homeStat.name;
-
-    const awayStat = away.statistics?.find(
-      (s) => normalizeStatName(s.name) === key
-    );
-
-    rows.push({
-      label,
-      home: homeStat.displayValue ?? homeStat.value ?? null,
-      away: awayStat?.displayValue ?? awayStat?.value ?? null,
-    });
-  }
-
-  return rows.length > 0 ? rows : null;
-}
-
-// Detalle completo de UN partido: estado, resultado, estadísticas (si ya
-// arrancó) y alineación. Si el partido todavía no arrancó, la alineación
-// que trae ESPN (si trae alguna) es la PROBABLE, no la confirmada — el
-// frontend es el que decide cómo rotular esto según el status.
-async function fetchMatchDetail(matchId, leagueSlug) {
-  const summary = await apiGet(
-    `${SITE_BASE}/${leagueSlug}/summary?event=${matchId}`
+  const response = await apiGet(
+    `/fixtures?league=${leagueId}&season=${SEASON}&from=${iso(from)}&to=${iso(to)}`
   );
 
-  const competition = summary.header?.competitions?.[0];
-  const state = competition?.status?.type?.state;
-  const status = statusFromApi(state);
-
-  const home = pickCompetitor(competition?.competitors || [], "home");
-  const away = pickCompetitor(competition?.competitors || [], "away");
-
-  const statistics = status === "scheduled" ? null : extractMatchStatistics(summary.boxscore);
-
-  const rosters = summary.rosters;
-  let lineups = null;
-  if (Array.isArray(rosters)) {
-    const homeLineup = buildLineupSide(rosters.find((r) => r.homeAway === "home"));
-    const awayLineup = buildLineupSide(rosters.find((r) => r.homeAway === "away"));
-    if (homeLineup?.starters?.length || awayLineup?.starters?.length) {
-      lineups = { home: homeLineup, away: awayLineup };
-    }
-  }
-
-  return {
-    id: matchId,
-    status,
-    home: home
-      ? {
-          id: home.team.id,
-          name: home.team.displayName,
-          crest: getTeamLogo(home.team),
-          score: status === "scheduled" ? null : Number(home.score),
-        }
-      : null,
-    away: away
-      ? {
-          id: away.team.id,
-          name: away.team.displayName,
-          crest: getTeamLogo(away.team),
-          score: status === "scheduled" ? null : Number(away.score),
-        }
-      : null,
-    start: competition?.date || null,
-    statistics,
-    lineups,
-    // true si lineups viene de un partido que TODAVÍA no arrancó — en ese
-    // caso, si ESPN trajo algo, es una probable formación, no la final.
-    lineupsAreProbable: status === "scheduled",
-  };
+  return response.map(normalizeMatch).sort((a, b) => a.start.localeCompare(b.start));
 }
 
-// El roster de ESPN puede venir de un par de formas distintas según el
-// deporte/competencia: agrupado por posición ({position, items: [...]})
-// o como lista plana de atletas. Probamos ambas. Si ninguna funciona,
-// logueamos la forma real que vino para poder ajustar esto rápido.
-function parseSquad(rosterRes) {
-  const squad = [];
-  const athletes = rosterRes.athletes || rosterRes.roster || [];
-
-  for (const group of athletes) {
-    // Caso 1: agrupado por posición, con sub-lista "items".
-    if (Array.isArray(group.items)) {
-      const positionLabel =
-        typeof group.position === "string"
-          ? group.position
-          : group.position?.name || group.position?.displayName || "Otros";
-
-      for (const p of group.items) {
-        const athlete = p.athlete || p;
-        const jerseyRaw = p.jersey ?? athlete.jersey;
-        squad.push({
-          id: athlete.id,
-          name: athlete.displayName || athlete.fullName || athlete.shortName,
-          number: jerseyRaw != null ? Number(jerseyRaw) : null,
-          position: positionLabel,
-          age: athlete.age ?? p.age ?? null,
-          photo: athlete.headshot?.href || p.headshot?.href || null,
-        });
-      }
-      continue;
-    }
-
-    // Caso 2: lista plana, cada elemento ya es un atleta (o envuelve uno
-    // en .athlete).
-    const athlete = group.athlete || group;
-    if (athlete?.displayName || athlete?.fullName) {
-      const positionLabel =
-        typeof athlete.position === "string"
-          ? athlete.position
-          : athlete.position?.name || athlete.position?.displayName || "Otros";
-      const jerseyRaw = group.jersey ?? athlete.jersey;
-
-      squad.push({
-        id: athlete.id,
-        name: athlete.displayName || athlete.fullName || athlete.shortName,
-        number: jerseyRaw != null ? Number(jerseyRaw) : null,
-        position: positionLabel,
-        age: athlete.age ?? null,
-        photo: athlete.headshot?.href || null,
-      });
-    }
-  }
-
-  if (squad.length === 0) {
-    console.error(
-      "[dataSource] no se pudo interpretar el plantel — claves recibidas:",
-      Object.keys(rosterRes || {})
-    );
-  }
-
-  return squad;
-}
-
-// Ficha de equipo: info básica + estadísticas de tabla + plantel + últimos
-// partidos jugados + alineación en vivo (si aplica).
-async function fetchTeamProfile(teamId, leagueSlug, leagueName) {
-  const [infoRes, rosterRes, scheduleRes, stats, liveLineup] = await Promise.all([
-    apiGet(`${SITE_BASE}/${leagueSlug}/teams/${teamId}`),
-    apiGet(`${SITE_BASE}/${leagueSlug}/teams/${teamId}/roster`),
-    apiGet(`${SITE_BASE}/${leagueSlug}/teams/${teamId}/schedule`),
-    fetchTeamStats(teamId, leagueSlug),
-    fetchLiveLineup(teamId, leagueSlug),
+// Ficha de equipo: info + plantel + últimos 5 partidos jugados.
+// 3 requests (info, plantel, últimos partidos) — cacheado 24hs desde
+// server.js, así que es barato en la práctica.
+async function fetchTeamProfile(teamId) {
+  const [infoRes, squadRes, recentFixturesRes] = await Promise.all([
+    apiGet(`/teams?id=${teamId}`),
+    apiGet(`/players/squads?team=${teamId}`),
+    apiGet(`/fixtures?team=${teamId}&last=5`),
   ]);
 
-  const team = infoRes.team;
-  if (!team) {
-    throw new Error("Equipo no encontrado");
-  }
+  const info = infoRes[0];
+  if (!info) throw new Error("Equipo no encontrado");
 
-  const squad = parseSquad(rosterRes);
+  const squad = (squadRes[0]?.players || []).map((p) => ({
+    id: p.id,
+    name: p.name,
+    number: p.number,
+    position: p.position,
+    age: p.age,
+    photo: p.photo || null,
+  }));
 
-  const recentForm = (scheduleRes.events || [])
-    .map((event) => {
-      const competition = event.competitions?.[0];
-      const state = competition?.status?.type?.state;
-      if (!statusIsFinished(state)) return null;
-
-      const home = pickCompetitor(competition.competitors, "home");
-      const away = pickCompetitor(competition.competitors, "away");
-      if (!home || !away) return null;
-
-      const isHome = home.team.id === String(teamId);
-      const mine = isHome ? home : away;
-      const rival = isHome ? away : home;
-      const goalsFor = Number(mine.score);
-      const goalsAgainst = Number(rival.score);
+  const recentForm = recentFixturesRes
+    .filter((f) => ["FT", "AET", "PEN"].includes(f.fixture.status.short))
+    .map((f) => {
+      const isHome = f.teams.home.id === Number(teamId);
+      const goalsFor = isHome ? f.goals.home : f.goals.away;
+      const goalsAgainst = isHome ? f.goals.away : f.goals.home;
+      const opponent = isHome ? f.teams.away.name : f.teams.home.name;
 
       let result = "E";
       if (goalsFor > goalsAgainst) result = "G";
       if (goalsFor < goalsAgainst) result = "P";
 
       return {
-        opponent: rival.team.displayName,
+        opponent,
         goalsFor,
         goalsAgainst,
         result,
-        date: event.date,
-        league: event.season?.slug || null,
+        date: f.fixture.date,
+        league: f.league.name,
       };
     })
-    .filter(Boolean)
-    .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, 5);
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  // No hay un endpoint que diga "la liga principal de este equipo" —
+  // un club puede jugar varias competencias a la vez (liga local + copa
+  // internacional, por ejemplo). Usamos el partido más reciente como
+  // mejor estimación de su liga "de todos los días", matcheando el
+  // nombre contra nuestra lista configurada. No cuesta ninguna request
+  // extra: ya tenemos recentForm de arriba.
+  const guessedLeagueName = recentForm[0]?.league;
+  const matchedLeague = guessedLeagueName
+    ? LEAGUES.find((l) => l.name.toLowerCase() === guessedLeagueName.toLowerCase())
+    : null;
 
   return {
-    id: team.id,
-    name: team.displayName,
-    country: null, // ESPN no siempre lo da a nivel equipo; el país ya se infiere de la liga
-    founded: null,
-    crest: getTeamLogo(team),
-    leagueSlug,
-    leagueName,
-    venue: team.venue
+    id: info.team.id,
+    name: info.team.name,
+    country: info.team.country,
+    founded: info.team.founded || null,
+    crest: info.team.logo || null,
+    leagueSlug: matchedLeague?.slug || null,
+    leagueName: matchedLeague?.name || null,
+    venue: info.venue
       ? {
-          name: team.venue.fullName || null,
-          city: team.venue.address?.city || null,
-          capacity: team.venue.capacity || null,
-          image: null,
+          name: info.venue.name || null,
+          city: info.venue.city || null,
+          capacity: info.venue.capacity || null,
+          image: info.venue.image || null,
         }
       : null,
-    stats,
     squad,
     recentForm,
-    liveLineup,
+  };
+}
+
+// Detalle de UN partido: info base (1 request) + estadísticas (1, solo si
+// ya arrancó) + alineación (1, real o probable según el momento). Hasta
+// 3 requests, cacheado 2 min desde server.js.
+async function fetchMatchDetail(matchId) {
+  const infoRes = await apiGet(`/fixtures?id=${matchId}`);
+  const info = infoRes[0];
+  if (!info) throw new Error("Partido no encontrado");
+
+  const status = statusFromApi(info.fixture.status.short);
+  const hasScore = status !== "scheduled";
+
+  let statistics = null;
+  if (status !== "scheduled") {
+    const statsRes = await apiGet(`/fixtures/statistics?fixture=${matchId}`);
+    if (statsRes.length === 2) {
+      const [homeStats, awayStats] = statsRes;
+      statistics = homeStats.statistics
+        .map((s, i) => ({
+          label: s.type,
+          home: s.value,
+          away: awayStats.statistics[i]?.value ?? null,
+        }))
+        .filter((row) => row.home !== null || row.away !== null);
+    }
+  }
+
+  let lineups = null;
+  try {
+    const lineupsRes = await apiGet(`/fixtures/lineups?fixture=${matchId}`);
+    if (lineupsRes.length === 2) {
+      const buildSide = (side) => ({
+        teamId: side.team.id,
+        teamName: side.team.name,
+        formation: side.formation || null,
+        starters: (side.startXI || []).map((p) => ({
+          id: p.player.id,
+          name: p.player.name,
+          number: p.player.number,
+          position: p.player.pos,
+        })),
+      });
+      const home = lineupsRes.find((s) => s.team.id === info.teams.home.id);
+      const away = lineupsRes.find((s) => s.team.id === info.teams.away.id);
+      if (home?.startXI?.length || away?.startXI?.length) {
+        lineups = { home: buildSide(home), away: buildSide(away) };
+      }
+    }
+  } catch (err) {
+    console.error(`[dataSource] no se pudo obtener alineación del partido ${matchId}:`, err.message);
+  }
+
+  return {
+    id: matchId,
+    status,
+    home: {
+      id: info.teams.home.id,
+      name: info.teams.home.name,
+      crest: info.teams.home.logo || null,
+      score: hasScore ? info.goals.home : null,
+    },
+    away: {
+      id: info.teams.away.id,
+      name: info.teams.away.name,
+      crest: info.teams.away.logo || null,
+      score: hasScore ? info.goals.away : null,
+    },
+    start: info.fixture.date,
+    statistics,
+    lineups,
+    lineupsAreProbable: status === "scheduled",
   };
 }
 
 module.exports = {
   fetchMatchesForDate,
-  buildTeamIndex,
-  fetchTeamProfile,
+  searchTeams,
+  searchLeagues,
+  resolveLeagueId,
   fetchLeagueStandings,
   fetchLeagueMatches,
+  fetchTeamProfile,
   fetchMatchDetail,
   LEAGUES,
 };

@@ -1,94 +1,72 @@
-# Marcador — backend (API pública de ESPN)
+# Marcador — backend (de vuelta a API-Football, cuidando el límite de 100/día)
 
-Migrado de API-Football a la API pública de ESPN
-(https://github.com/pseudo-r/Public-ESPN-API). **No requiere cuenta ni API
-key** — se terminó el problema de cuentas suspendidas.
-
-⚠️ **Importante**: es una API no oficial, no documentada por ESPN (la
-comunidad la reversineó investigando el sitio). Puede cambiar de formato o
-dejar de funcionar sin aviso en cualquier momento. No hay SLA ni soporte.
-Para un proyecto personal/hobby está perfecta; para algo con usuarios
-reales y necesidad de estabilidad garantizada, en algún momento conviene
-evaluar un proveedor pago con contrato.
+Volvimos de ESPN a API-Football (dashboard.api-football.com), esta vez con
+una arquitectura pensada específicamente para el plan free (100
+requests/día).
 
 ```
-dataSource.js  →  habla con ESPN, normaliza partidos/equipos/planteles
+dataSource.js  →  habla con API-Football
+quotaGuard.js  →  cuenta requests del día, corta antes de llegar a 100
 cache.js       →  cache en memoria genérico, por clave y TTL
 server.js      →  la API que consume el frontend
 ```
 
-## Diferencia clave con las versiones anteriores
+## Cómo se cuida la cuota
 
-- **Sin API key**: no hay `.env` con secretos que configurar.
-- **Sin límite de cuota documentado**: no hay "100 requests/día" que
-  cuidar. Igual seguimos cacheando (5 min partidos, 24hs equipos/búsqueda)
-  para no abusar de un servicio que no es nuestro.
-- **Búsqueda sin gastar requests por letra**: en vez de pedirle a la API
-  externa en cada búsqueda, arma un índice de todos los equipos de las
-  ligas configuradas UNA vez por día (`buildTeamIndex`) y busca sobre eso
-  en memoria. Rápido y no le pega a ESPN por cada tecla que el usuario
-  aprieta.
-
-## Ligas incluidas
-
-Editables en el array `LEAGUES` de `dataSource.js` — agregar o sacar una
-liga es agregar/sacar una línea, no hace falta tocar nada más. Lista
-completa de slugs disponibles (300+ ligas de todo el mundo) en la
-documentación de Public-ESPN-API linkeada arriba.
-
-Por default: Liga Profesional Argentina, Copa Argentina, Copa
-Libertadores, Copa Sudamericana, Mundial, Champions League, Premier
-League, La Liga, Serie A, Bundesliga, Ligue 1, Primeira Liga, Eredivisie,
-Brasileirão.
+1. **El feed de partidos por día es 1 sola request**, no una por liga.
+   `/fixtures?date=X` trae TODAS las ligas del mundo de una — filtramos
+   por país acá adentro (`INCLUDE_COUNTRIES` en `dataSource.js`).
+2. **La búsqueda de ligas no gasta nada** — filtra una lista fija propia,
+   no le pregunta nada a la API externa.
+3. **El ID numérico de cada liga se resuelve una sola vez**, y se cachea
+   90 días. Es lo único que necesita saber el ID exacto de API-Football
+   (para tabla de posiciones y partidos de una liga puntual) — en vez de
+   adivinar/hardcodear números que pueden estar mal, se busca por
+   nombre+país la primera vez y después se reutiliza casi para siempre.
+4. **TTLs largos en todo**: 20 min para partidos del día, 1 hora para
+   búsquedas, 24hs para fichas de equipo, 2hs para tablas de posiciones.
+5. **`quotaGuard.js` corta antes de las 100** (con margen de seguridad de
+   5), pase lo que pase. Si se llega al límite, la API devuelve un 503
+   con `quotaExceeded: true` en vez de intentar la request igual — así la
+   cuenta nunca se pasa del límite real y no corre riesgo de que
+   api-football.com la suspenda de nuevo.
 
 ## Cómo correrlo
 
-```
-npm install
-npm start
-```
-
-No hace falta `.env` para que funcione (no hay API key), aunque podés
-copiar `.env.example` a `.env` si querés ajustar `CACHE_TTL_MS` o `PORT`.
-
-Probar: `curl "http://localhost:3001/api/matches?date=2026-08-16"`
+1. `cp .env.example .env` y pegá tu `API_FOOTBALL_KEY`.
+2. `npm install && npm start`
+3. Probar: `curl "http://localhost:3001/api/matches?date=2026-08-20"`
+4. Ver cuánta cuota llevás gastada hoy: `curl "http://localhost:3001/api/quota"`
 
 ## Endpoints
 
-- `GET /api/matches?date=YYYY-MM-DD`
-- `GET /api/search?q=boca` → busca sobre el índice de equipos cacheado
-- `GET /api/teams/:id` → ficha del equipo: info, cancha, estadísticas de
-  tabla, plantel, últimos 5 partidos jugados, y alineación en vivo si
-  aplica
-- `GET /api/leagues` → lista fija de ligas (no pega contra ESPN)
-- `GET /api/leagues/:slug/standings` → tabla de posiciones completa de
-  esa liga (`{ standings: [...] }`, o `{ standings: null }` si la
-  competencia no tiene fase de tabla, como una copa eliminatoria).
-  Cacheada 30 min.
-- `GET /api/leagues/:slug/matches` → partidos de esa liga en una ventana
-  de ~3 semanas (7 días atrás, 14 adelante), independiente del día
-  seleccionado en el feed principal. Cacheada 10 min.
-- `GET /api/matches/:id?league=slug` → detalle de UN partido: estado,
-  resultado, estadísticas (posesión, remates, córners, etc. — `null` si
-  todavía no arrancó) y alineación titular. Si el partido no arrancó
-  todavía, `lineupsAreProbable: true` avisa que la alineación (si hay) es
-  probable, no confirmada. Cacheada 2 min (los datos en vivo cambian
-  rápido).
+- `GET /api/matches?date=YYYY-MM-DD` — 1 request (cacheado 20 min)
+- `GET /api/search?q=boca` — 1 request de equipos + búsqueda local de
+  ligas (cacheado 1h)
+- `GET /api/teams/:id` — 3 requests (info, plantel, últimos partidos —
+  cacheado 24hs)
+- `GET /api/leagues` — no gasta requests (lista fija)
+- `GET /api/leagues/:slug/standings` — hasta 2 requests la primera vez
+  (resolver ID + tabla), 1 las siguientes veces (ID ya cacheado 90 días).
+  Cacheado 2hs.
+- `GET /api/leagues/:slug/matches` — igual que standings, cacheado 30 min
+- `GET /api/matches/:id` — hasta 3 requests (info + estadísticas si ya
+  arrancó + alineación). Cacheado 2 min.
+- `GET /api/quota` — cuánto se gastó hoy, sin costo
 - `GET /health`
 
-## Lo más frágil de todo (leer antes de tocar `dataSource.js`)
+## Si algún día hay que ajustar el límite
 
-`fetchTeamStats` y `fetchLiveLineup` son las partes más riesgosas de todo
-el backend: dependen de la forma exacta del JSON de `/standings` y
-`/summary?event=`, que ESPN no documenta en ningún lado oficial. Los
-armé con el mejor criterio posible (probé varios nombres de campo
-alternativos para cada stat, ver `STAT_ALIASES`), pero si algún día algo
-deja de funcionar ahí, revisá primero la respuesta cruda de esos dos
-endpoints contra un partido real antes de asumir que el código está mal.
+Si contratás un plan pago con más cuota, solo hay que cambiar
+`API_DAILY_LIMIT` en el `.env` (en Render: Environment → esa variable) —
+no hace falta tocar código.
 
-## Si ESPN cambia el formato y algo deja de andar
+## Nota sobre la liga de un equipo
 
-Los tres puntos más frágiles (por ser API no oficial) están todos en
-`dataSource.js`, en las funciones `normalizeEvent`, `buildTeamIndex` y
-`fetchTeamProfile` — son las que asumen la forma exacta del JSON que
-devuelve ESPN. Si un día algo rompe, seguramente sea ahí.
+Un club puede jugar más de una competencia a la vez (liga local + copa
+internacional). Como API-Football no dice "esta es SU liga principal",
+la inferimos a partir del partido más reciente del equipo (sin gastar
+ninguna request extra, ya la tenemos de la ficha del equipo). Puede fallar
+si el último partido que jugó fue justo de una copa — en ese caso, la
+sección de tabla de posiciones simplemente no aparece en la ficha, en vez
+de mostrar algo incorrecto.
