@@ -58,6 +58,17 @@ function pickCompetitor(competitors, side) {
   return competitors.find((c) => c.homeAway === side);
 }
 
+// El campo del escudo viene con nombres distintos según el endpoint:
+// el scoreboard usa "logo" (string), pero /summary y otros a veces traen
+// "logos" (array de objetos {href}). Probamos ambos formatos acá, en un
+// solo lugar, para no repetir esta lógica en cada función.
+function getTeamLogo(team) {
+  if (!team) return null;
+  if (typeof team.logo === "string") return team.logo;
+  if (Array.isArray(team.logos) && team.logos[0]?.href) return team.logos[0].href;
+  return null;
+}
+
 // Convierte UN evento crudo del scoreboard de ESPN al shape que usa el
 // frontend.
 function normalizeEvent(event, leagueName, leagueSlug) {
@@ -80,11 +91,11 @@ function normalizeEvent(event, leagueName, leagueSlug) {
     home: home.team.displayName,
     homeId: home.team.id,
     homeAb: home.team.abbreviation || abbreviate(home.team.displayName),
-    homeCrest: home.team.logo || null,
+    homeCrest: getTeamLogo(home.team),
     away: away.team.displayName,
     awayId: away.team.id,
     awayAb: away.team.abbreviation || abbreviate(away.team.displayName),
-    awayCrest: away.team.logo || null,
+    awayCrest: getTeamLogo(away.team),
     scoreHome: hasScore ? Number(home.score) : null,
     scoreAway: hasScore ? Number(away.score) : null,
     start: event.date,
@@ -139,7 +150,7 @@ async function buildTeamIndex() {
       return teams.map((t) => ({
         id: t.team.id,
         name: t.team.displayName,
-        crest: t.team.logos?.[0]?.href || null,
+        crest: getTeamLogo(t.team),
         leagueSlug: slug,
         leagueName: name,
       }));
@@ -190,7 +201,7 @@ function parseStandingsEntry(entry) {
   return {
     teamId: entry.team?.id,
     teamName: entry.team?.displayName,
-    crest: entry.team?.logos?.[0]?.href || null,
+    crest: getTeamLogo(entry.team),
     rank: findStat(stats, STAT_ALIASES.rank),
     played: findStat(stats, STAT_ALIASES.played),
     wins: findStat(stats, STAT_ALIASES.wins),
@@ -414,7 +425,7 @@ async function fetchMatchDetail(matchId, leagueSlug) {
       ? {
           id: home.team.id,
           name: home.team.displayName,
-          crest: home.team.logo || null,
+          crest: getTeamLogo(home.team),
           score: status === "scheduled" ? null : Number(home.score),
         }
       : null,
@@ -422,7 +433,7 @@ async function fetchMatchDetail(matchId, leagueSlug) {
       ? {
           id: away.team.id,
           name: away.team.displayName,
-          crest: away.team.logo || null,
+          crest: getTeamLogo(away.team),
           score: status === "scheduled" ? null : Number(away.score),
         }
       : null,
@@ -433,6 +444,68 @@ async function fetchMatchDetail(matchId, leagueSlug) {
     // caso, si ESPN trajo algo, es una probable formación, no la final.
     lineupsAreProbable: status === "scheduled",
   };
+}
+
+// El roster de ESPN puede venir de un par de formas distintas según el
+// deporte/competencia: agrupado por posición ({position, items: [...]})
+// o como lista plana de atletas. Probamos ambas. Si ninguna funciona,
+// logueamos la forma real que vino para poder ajustar esto rápido.
+function parseSquad(rosterRes) {
+  const squad = [];
+  const athletes = rosterRes.athletes || rosterRes.roster || [];
+
+  for (const group of athletes) {
+    // Caso 1: agrupado por posición, con sub-lista "items".
+    if (Array.isArray(group.items)) {
+      const positionLabel =
+        typeof group.position === "string"
+          ? group.position
+          : group.position?.name || group.position?.displayName || "Otros";
+
+      for (const p of group.items) {
+        const athlete = p.athlete || p;
+        const jerseyRaw = p.jersey ?? athlete.jersey;
+        squad.push({
+          id: athlete.id,
+          name: athlete.displayName || athlete.fullName || athlete.shortName,
+          number: jerseyRaw != null ? Number(jerseyRaw) : null,
+          position: positionLabel,
+          age: athlete.age ?? p.age ?? null,
+          photo: athlete.headshot?.href || p.headshot?.href || null,
+        });
+      }
+      continue;
+    }
+
+    // Caso 2: lista plana, cada elemento ya es un atleta (o envuelve uno
+    // en .athlete).
+    const athlete = group.athlete || group;
+    if (athlete?.displayName || athlete?.fullName) {
+      const positionLabel =
+        typeof athlete.position === "string"
+          ? athlete.position
+          : athlete.position?.name || athlete.position?.displayName || "Otros";
+      const jerseyRaw = group.jersey ?? athlete.jersey;
+
+      squad.push({
+        id: athlete.id,
+        name: athlete.displayName || athlete.fullName || athlete.shortName,
+        number: jerseyRaw != null ? Number(jerseyRaw) : null,
+        position: positionLabel,
+        age: athlete.age ?? null,
+        photo: athlete.headshot?.href || null,
+      });
+    }
+  }
+
+  if (squad.length === 0) {
+    console.error(
+      "[dataSource] no se pudo interpretar el plantel — claves recibidas:",
+      Object.keys(rosterRes || {})
+    );
+  }
+
+  return squad;
 }
 
 // Ficha de equipo: info básica + estadísticas de tabla + plantel + últimos
@@ -451,20 +524,7 @@ async function fetchTeamProfile(teamId, leagueSlug, leagueName) {
     throw new Error("Equipo no encontrado");
   }
 
-  const squad = [];
-  for (const group of rosterRes.athletes || []) {
-    const positionLabel = group.position || "Otros";
-    for (const p of group.items || []) {
-      squad.push({
-        id: p.id,
-        name: p.displayName,
-        number: p.jersey ? Number(p.jersey) : null,
-        position: positionLabel,
-        age: p.age ?? null,
-        photo: p.headshot?.href || null,
-      });
-    }
-  }
+  const squad = parseSquad(rosterRes);
 
   const recentForm = (scheduleRes.events || [])
     .map((event) => {
@@ -504,7 +564,7 @@ async function fetchTeamProfile(teamId, leagueSlug, leagueName) {
     name: team.displayName,
     country: null, // ESPN no siempre lo da a nivel equipo; el país ya se infiere de la liga
     founded: null,
-    crest: team.logos?.[0]?.href || null,
+    crest: getTeamLogo(team),
     leagueSlug,
     leagueName,
     venue: team.venue
