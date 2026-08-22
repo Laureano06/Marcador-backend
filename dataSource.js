@@ -40,6 +40,8 @@ const INCLUDE_COUNTRIES = [
   "Brazil",
   "Portugal",
   "Netherlands",
+  "Uruguay",
+  "Chile",
 ];
 
 // Ligas para el panel lateral / página de liga (tabla + partidos propios).
@@ -47,20 +49,25 @@ const INCLUDE_COUNTRIES = [
 // primera vez que se pide cada una (ver resolveLeagueId) y se cachea
 // larguísimo desde server.js.
 const LEAGUES = [
-  { slug: "arg-liga-profesional", name: "Liga Profesional Argentina", country: "Argentina" },
-  { slug: "arg-copa", name: "Copa Argentina", country: "Argentina" },
-  { slug: "conmebol-libertadores", name: "Copa Libertadores", country: "World" },
-  { slug: "conmebol-sudamericana", name: "Copa Sudamericana", country: "World" },
-  { slug: "world-cup", name: "Mundial", country: "World" },
-  { slug: "uefa-champions", name: "UEFA Champions League", country: "World" },
-  { slug: "eng-premier", name: "Premier League", country: "England" },
-  { slug: "esp-laliga", name: "La Liga", country: "Spain" },
-  { slug: "ita-seriea", name: "Serie A", country: "Italy" },
-  { slug: "ger-bundesliga", name: "Bundesliga", country: "Germany" },
-  { slug: "fra-ligue1", name: "Ligue 1", country: "France" },
-  { slug: "por-primeira", name: "Primeira Liga", country: "Portugal" },
-  { slug: "ned-eredivisie", name: "Eredivisie", country: "Netherlands" },
-  { slug: "bra-serieA", name: "Brasileirão", country: "Brazil" },
+  // --- Sudamérica ---
+  { slug: "arg-liga-profesional", name: "Liga Profesional Argentina", country: "Argentina", region: "Sudamérica" },
+  { slug: "arg-copa", name: "Copa Argentina", country: "Argentina", region: "Sudamérica" },
+  { slug: "bra-serieA", name: "Brasileirão", country: "Brazil", region: "Sudamérica" },
+  { slug: "uru-primera", name: "Primera División", country: "Uruguay", region: "Sudamérica" },
+  { slug: "chi-primera", name: "Primera División", country: "Chile", region: "Sudamérica" },
+  // --- Europa ---
+  { slug: "eng-premier", name: "Premier League", country: "England", region: "Europa" },
+  { slug: "esp-laliga", name: "La Liga", country: "Spain", region: "Europa" },
+  { slug: "ita-seriea", name: "Serie A", country: "Italy", region: "Europa" },
+  { slug: "ger-bundesliga", name: "Bundesliga", country: "Germany", region: "Europa" },
+  { slug: "fra-ligue1", name: "Ligue 1", country: "France", region: "Europa" },
+  { slug: "por-primeira", name: "Primeira Liga", country: "Portugal", region: "Europa" },
+  { slug: "ned-eredivisie", name: "Eredivisie", country: "Netherlands", region: "Europa" },
+  // --- Internacional (competencias continentales/globales, no de un solo país) ---
+  { slug: "world-cup", name: "Mundial", country: "World", region: "Internacional" },
+  { slug: "uefa-champions", name: "UEFA Champions League", country: "World", region: "Internacional" },
+  { slug: "conmebol-libertadores", name: "Copa Libertadores", country: "World", region: "Internacional" },
+  { slug: "conmebol-sudamericana", name: "Copa Sudamericana", country: "World", region: "Internacional" },
 ];
 
 async function apiGet(path) {

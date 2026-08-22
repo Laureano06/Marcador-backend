@@ -127,7 +127,7 @@ app.get("/api/teams/:id", async (req, res) => {
 
 // GET /api/leagues -> lista fija, no gasta requests.
 app.get("/api/leagues", (_req, res) => {
-  res.json(LEAGUES.map(({ slug, name }) => ({ slug, name })));
+  res.json(LEAGUES.map(({ slug, name, region }) => ({ slug, name, region })));
 });
 
 // GET /api/leagues/:slug/standings
