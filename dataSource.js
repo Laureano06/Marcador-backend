@@ -26,6 +26,13 @@ const BASE_URL = "https://v3.football.api-sports.io";
 // código si hay que ajustarlo.
 const SEASON = Number(process.env.API_FOOTBALL_SEASON || new Date().getFullYear());
 
+// API-Football corta los "días" en UTC por default cuando filtrás por
+// fecha (?date=X, ?from=X&to=Y) — un partido a las 21hs en Argentina
+// (UTC-3) cae después de medianoche UTC, así que sin esto aparecía
+// agrupado en el día siguiente. Este parámetro le dice a la API con qué
+// zona horaria cortar los días.
+const TIMEZONE = process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
+
 // País por país, en vez de ID de liga por ID de liga — mucho más difícil
 // de arruinar (ver charla anterior sobre por qué). Cubre lo que se ve en
 // el feed principal de "todas las ligas".
@@ -50,24 +57,46 @@ const INCLUDE_COUNTRIES = [
 // larguísimo desde server.js.
 const LEAGUES = [
   // --- Sudamérica ---
-  { slug: "arg-liga-profesional", name: "Liga Profesional Argentina", country: "Argentina", region: "Sudamérica" },
-  { slug: "arg-copa", name: "Copa Argentina", country: "Argentina", region: "Sudamérica" },
-  { slug: "bra-serieA", name: "Brasileirão", country: "Brazil", region: "Sudamérica" },
-  { slug: "uru-primera", name: "Primera División", country: "Uruguay", region: "Sudamérica" },
-  { slug: "chi-primera", name: "Primera División", country: "Chile", region: "Sudamérica" },
+  {
+    slug: "arg-liga-profesional",
+    name: "Liga Profesional Argentina",
+    country: "Argentina",
+    region: "Sudamérica",
+    aliases: ["Liga Profesional Argentina", "Liga Profesional", "Primera División"],
+  },
+  { slug: "arg-copa", name: "Copa Argentina", country: "Argentina", region: "Sudamérica", aliases: ["Copa Argentina"] },
+  { slug: "bra-serieA", name: "Brasileirão", country: "Brazil", region: "Sudamérica", aliases: ["Serie A", "Brasileirão", "Brasileiro"] },
+  {
+    slug: "uru-primera",
+    name: "Primera División",
+    country: "Uruguay",
+    region: "Sudamérica",
+    aliases: ["Primera División", "Liga AUF Uruguaya", "Campeonato Uruguayo"],
+  },
+  {
+    slug: "chi-primera",
+    // Ojo: esta liga se rebrandeó de "Primera División" a "Liga de
+    // Primera" hace unas temporadas — por eso el nombre de display y los
+    // alias de búsqueda son distintos. Si en el futuro cambia de nuevo,
+    // acá es donde hay que sumar el nombre nuevo.
+    name: "Liga de Primera",
+    country: "Chile",
+    region: "Sudamérica",
+    aliases: ["Liga de Primera", "Primera División", "Campeonato Nacional"],
+  },
   // --- Europa ---
-  { slug: "eng-premier", name: "Premier League", country: "England", region: "Europa" },
-  { slug: "esp-laliga", name: "La Liga", country: "Spain", region: "Europa" },
-  { slug: "ita-seriea", name: "Serie A", country: "Italy", region: "Europa" },
-  { slug: "ger-bundesliga", name: "Bundesliga", country: "Germany", region: "Europa" },
-  { slug: "fra-ligue1", name: "Ligue 1", country: "France", region: "Europa" },
-  { slug: "por-primeira", name: "Primeira Liga", country: "Portugal", region: "Europa" },
-  { slug: "ned-eredivisie", name: "Eredivisie", country: "Netherlands", region: "Europa" },
+  { slug: "eng-premier", name: "Premier League", country: "England", region: "Europa", aliases: ["Premier League"] },
+  { slug: "esp-laliga", name: "La Liga", country: "Spain", region: "Europa", aliases: ["La Liga", "Primera División", "LaLiga"] },
+  { slug: "ita-seriea", name: "Serie A", country: "Italy", region: "Europa", aliases: ["Serie A"] },
+  { slug: "ger-bundesliga", name: "Bundesliga", country: "Germany", region: "Europa", aliases: ["Bundesliga"] },
+  { slug: "fra-ligue1", name: "Ligue 1", country: "France", region: "Europa", aliases: ["Ligue 1"] },
+  { slug: "por-primeira", name: "Primeira Liga", country: "Portugal", region: "Europa", aliases: ["Primeira Liga", "Liga Portugal"] },
+  { slug: "ned-eredivisie", name: "Eredivisie", country: "Netherlands", region: "Europa", aliases: ["Eredivisie"] },
   // --- Internacional (competencias continentales/globales, no de un solo país) ---
-  { slug: "world-cup", name: "Mundial", country: "World", region: "Internacional" },
-  { slug: "uefa-champions", name: "UEFA Champions League", country: "World", region: "Internacional" },
-  { slug: "conmebol-libertadores", name: "Copa Libertadores", country: "World", region: "Internacional" },
-  { slug: "conmebol-sudamericana", name: "Copa Sudamericana", country: "World", region: "Internacional" },
+  { slug: "world-cup", name: "Mundial", country: "World", region: "Internacional", aliases: ["World Cup"] },
+  { slug: "uefa-champions", name: "UEFA Champions League", country: "World", region: "Internacional", aliases: ["UEFA Champions League", "Champions League"] },
+  { slug: "conmebol-libertadores", name: "Copa Libertadores", country: "World", region: "Internacional", aliases: ["Copa Libertadores", "CONMEBOL Libertadores"] },
+  { slug: "conmebol-sudamericana", name: "Copa Sudamericana", country: "World", region: "Internacional", aliases: ["Copa Sudamericana", "CONMEBOL Sudamericana"] },
 ];
 
 async function apiGet(path) {
@@ -146,7 +175,9 @@ function normalizeMatch(raw) {
 // llamada a la API. Es la joya de la corona de esta versión: el feed de
 // "todas las ligas disponibles" cuesta 1 request, no 14.
 async function fetchMatchesForDate(dateStr) {
-  const response = await apiGet(`/fixtures?date=${dateStr}`);
+  const response = await apiGet(
+    `/fixtures?date=${dateStr}&timezone=${encodeURIComponent(TIMEZONE)}`
+  );
 
   return response
     .filter((raw) => INCLUDE_COUNTRIES.includes(raw.league.country))
@@ -245,7 +276,7 @@ async function fetchLeagueMatches(leagueId, daysPast = 7, daysFuture = 14) {
   const iso = (d) => d.toISOString().slice(0, 10);
 
   const response = await apiGet(
-    `/fixtures?league=${leagueId}&season=${SEASON}&from=${iso(from)}&to=${iso(to)}`
+    `/fixtures?league=${leagueId}&season=${SEASON}&from=${iso(from)}&to=${iso(to)}&timezone=${encodeURIComponent(TIMEZONE)}`
   );
 
   return response.map(normalizeMatch).sort((a, b) => a.start.localeCompare(b.start));
