@@ -99,15 +99,51 @@ const LEAGUES = [
   { slug: "conmebol-sudamericana", name: "Copa Sudamericana", country: "World", region: "Internacional", aliases: ["Copa Sudamericana", "CONMEBOL Sudamericana"] },
 ];
 
-async function apiGet(path) {
+// El plan free de API-Football tiene, ADEMÁS del límite de 100/día, un
+// límite de requests POR MINUTO (típicamente 10). El quotaGuard cuida el
+// límite diario, pero no alcanza para evitar ráfagas cortas — por eso acá
+// espaciamos cada request saliente con un mínimo de tiempo entre una y la
+// siguiente, en una cola. Con 6.5s de espaciado como mínimo, el máximo
+// posible es ~9 requests/minuto, por debajo del límite típico de 10.
+const MIN_REQUEST_INTERVAL_MS = 6500;
+let requestQueue = Promise.resolve();
+let lastRequestAt = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function throttledFetch(url, options) {
+  const run = requestQueue.then(async () => {
+    const wait = Math.max(0, lastRequestAt + MIN_REQUEST_INTERVAL_MS - Date.now());
+    if (wait > 0) await sleep(wait);
+    lastRequestAt = Date.now();
+    return fetch(url, options);
+  });
+  // Encadenamos aunque falle, para que un error no trabe la cola entera.
+  requestQueue = run.catch(() => {});
+  return run;
+}
+
+async function apiGet(path, retriesLeft = 2) {
   if (!canMakeRequest()) {
     throw new QuotaExceededError();
   }
 
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await throttledFetch(`${BASE_URL}${path}`, {
     headers: { "x-apisports-key": process.env.API_FOOTBALL_KEY },
   });
   recordRequest();
+
+  // 429 = nos pasamos del límite por minuto, a pesar del espaciado (puede
+  // pasar si hay ráfagas de varios usuarios a la vez). Esperamos un poco
+  // y reintentamos, en vez de fallar directo — lo más probable es que la
+  // siguiente vuelta ya funcione.
+  if (res.status === 429 && retriesLeft > 0) {
+    console.warn(`[dataSource] 429 (límite por minuto) en ${path}, reintentando...`);
+    await sleep(8000);
+    return apiGet(path, retriesLeft - 1);
+  }
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");

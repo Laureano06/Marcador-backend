@@ -30,6 +30,15 @@ server.js      →  la API que consume el frontend
    con `quotaExceeded: true` en vez de intentar la request igual — así la
    cuenta nunca se pasa del límite real y no corre riesgo de que
    api-football.com la suspenda de nuevo.
+6. **Límite por minuto, aparte del diario**: el plan free también limita
+   cuántas requests podés mandar por MINUTO (no solo por día). Todas las
+   requests salen espaciadas al menos 6.5s entre sí (`throttledFetch` en
+   `dataSource.js`), y si igual llega a pasar un 429 (límite por minuto
+   superado), se reintenta solo después de una pausa — en vez de fallar
+   directo. **El costo de esto**: la primera vez que alguien ve algo con
+   varias requests (una ficha de equipo, por ejemplo, hace 3), puede
+   tardar 15-20 segundos en cargar en frío. Una vez cacheado, vuelve a
+   ser instantáneo.
 
 ## Cómo correrlo
 
