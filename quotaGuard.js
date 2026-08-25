@@ -87,6 +87,21 @@ function getUsage() {
   return { used: count, limit: DAILY_LIMIT, date: countDate };
 }
 
+// El contador local solo sabe lo que ESTE proceso pidió — si la cuenta
+// real ya se agotó por otra vía (otro proceso con la misma key, un
+// redeploy que reinició el contador a 0 mientras la cuenta seguía
+// gastada del lado de API-Football), nuestro margen de seguridad no
+// alcanza a verlo venir. dataSource.js llama a esto cuando la propia API
+// contesta "reached the request limit for the day", para que el resto
+// del día este proceso corte de una en vez de seguir gastando llamadas
+// reales que van a fallar igual.
+function markExhausted() {
+  resetIfNewDay();
+  count = DAILY_LIMIT;
+  saveToDisk();
+  console.warn("[quota] la API reportó cuota diaria agotada — cortando por hoy.");
+}
+
 class QuotaExceededError extends Error {
   constructor() {
     super(
@@ -96,4 +111,4 @@ class QuotaExceededError extends Error {
   }
 }
 
-module.exports = { canMakeRequest, recordRequest, getUsage, QuotaExceededError };
+module.exports = { canMakeRequest, recordRequest, getUsage, markExhausted, QuotaExceededError };

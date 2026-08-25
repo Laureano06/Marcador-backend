@@ -20,7 +20,7 @@
 // funciones no existen acá: no hay forma de arreglarlas con código,
 // hace falta un plan pago de API-Football.
 
-const { canMakeRequest, recordRequest, QuotaExceededError } = require("./quotaGuard");
+const { canMakeRequest, recordRequest, markExhausted, QuotaExceededError } = require("./quotaGuard");
 
 const BASE_URL = "https://v3.football.api-sports.io";
 
@@ -131,6 +131,17 @@ async function apiGet(path, retriesLeft = 2) {
   const data = await res.json();
 
   if (data.errors && Object.keys(data.errors).length > 0) {
+    // "reached the request limit for the day" es la cuota REAL de la
+    // cuenta agotada — puede pasar aunque nuestro contador local diga
+    // que hay margen (otro proceso con la misma key, o un redeploy que
+    // reinició el contador a 0 mientras la cuenta seguía gastada del
+    // lado de API-Football). Cuando pasa, sincronizamos el guard para
+    // que este proceso corte de una por hoy, en vez de seguir mandando
+    // requests reales que van a fallar igual.
+    if (data.errors.requests) {
+      markExhausted();
+      throw new QuotaExceededError();
+    }
     throw new Error(`API-Football error: ${JSON.stringify(data.errors)}`);
   }
 

@@ -73,6 +73,25 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
    `server.js`): si el feed de HOY no está en cache, lo precarga en
    background sin bloquear que el server empiece a escuchar. Con el
    cache persistido (punto 6), en el caso normal esto no gasta nada.
+9. **El contador local se sincroniza si la API dice que la cuota REAL ya
+   se agotó** (`markExhausted()` en `quotaGuard.js`, disparado desde
+   `apiGet` en `dataSource.js` cuando la respuesta trae
+   `errors.requests`). El contador de este proceso solo sabe lo que ÉL
+   pidió — si la cuenta se quedó sin cuota por otra vía (otro proceso con
+   la misma key, o un redeploy que reinició el contador a 0 mientras la
+   cuenta seguía gastada del lado de API-Football), sin esto seguiríamos
+   mandando requests reales que fallan igual, una por una, hasta que el
+   margen de seguridad las corte solo. Con esto, en cuanto la API
+   contesta ese error una vez, el proceso entero corta para el resto del
+   día.
+
+   **Nota real de esta build**: hoy el límite diario real se agotó en
+   medio del desarrollo — no por tráfico de usuarios, sino por las
+   pruebas directas contra la API (afuera del cache) más varios
+   redeploys seguidos, cada uno reiniciando este contador local a 0
+   mientras la cuenta real seguía gastada. Es exactamente el escenario
+   que el punto 9 ahora detecta mejor. En uso normal (sin desarrollo
+   activo en el mismo día) esto no debería repetirse.
 
 ## Cómo correrlo
 
