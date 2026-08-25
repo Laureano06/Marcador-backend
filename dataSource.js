@@ -248,26 +248,42 @@ function searchLeagues(query) {
 // configuradas (por nombre + país). Se llama UNA vez por liga — el
 // resultado se cachea larguísimo desde server.js, así que en la práctica
 // esto se paga una sola vez por liga, para siempre.
+//
+// Ojo: /leagues ya no acepta `country` y `search` juntos ("The Country
+// field cannot be used with the Search field") — antes funcionaba y dejó
+// de andar sin previo aviso de API-Football. Por eso buscamos solo por
+// nombre y filtramos por país acá adentro.
+//
+// Además probamos `name` y, si no da nada, cada uno de los `aliases`: el
+// nombre "de display" que usamos (ej. "Liga de Primera" para Chile) puede
+// no coincidir con cómo lo tiene cargado API-Football todavía (ellos
+// siguen usando "Primera División" ahí, aunque el torneo se rebrandeó
+// hace rato en la vida real).
 async function resolveLeagueId(league) {
-  const response = await apiGet(
-    `/leagues?country=${encodeURIComponent(league.country === "World" ? "" : league.country)}&search=${encodeURIComponent(league.name)}`
+  const searchTerms = [league.name, ...(league.aliases || [])].filter(
+    (term, i, arr) => arr.indexOf(term) === i
   );
 
-  if (response.length === 0) {
-    console.error(
-      `[dataSource] no se encontró la liga "${league.name}" (${league.country}) en API-Football`
-    );
-    return null;
+  for (const term of searchTerms) {
+    const response = await apiGet(`/leagues?search=${encodeURIComponent(term)}`);
+    const pool =
+      league.country === "World"
+        ? response
+        : response.filter((r) => r.country?.name === league.country);
+
+    if (pool.length === 0) continue;
+
+    // Preferimos una coincidencia de nombre exacta (insensible a
+    // mayúsculas) contra el término que dio resultado; si no hay, nos
+    // quedamos con el primero del país correcto.
+    const exact = pool.find((r) => r.league.name.toLowerCase() === term.toLowerCase());
+    return (exact || pool[0]).league.id;
   }
 
-  // Preferimos una coincidencia de nombre exacta (insensible a mayúsculas);
-  // si no hay, nos quedamos con el primer resultado.
-  const exact = response.find(
-    (r) => r.league.name.toLowerCase() === league.name.toLowerCase()
+  console.error(
+    `[dataSource] no se encontró la liga "${league.name}" (${league.country}) en API-Football`
   );
-  const chosen = exact || response[0];
-
-  return chosen.league.id;
+  return null;
 }
 
 // Tabla de posiciones completa de una liga (ya resuelto su ID numérico).
