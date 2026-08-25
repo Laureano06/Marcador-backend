@@ -43,11 +43,16 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
    extra, es el mismo dato de siempre mostrado distinto.
 2. **La búsqueda de ligas no gasta nada** — filtra una lista fija propia
    (nombre + alias), no le pregunta nada a la API externa.
-3. **TTL variable en el feed de partidos según la fecha**: 20 min si es
-   HOY (hay partidos en vivo), 6hs si es una fecha futura (el fixture
-   rara vez se reprograma), 7 días si ya se jugó (el resultado final no
-   cambia más). 1 hora para búsquedas, 24hs para fichas de equipo, 2 min
-   para detalle de partido.
+3. **TTL variable según el estado, no un número fijo para todo**: el feed
+   de partidos por fecha usa 20 min si es HOY (hay partidos en vivo), 6hs
+   si es una fecha futura (el fixture rara vez se reprograma), 7 días si
+   ya se jugó (el resultado final no cambia más). El detalle de un
+   partido puntual sigue la misma idea: 2 min si está EN VIVO o todavía
+   no arrancó (puede cambiar de estado en cualquier momento), pero **7
+   días si ya terminó** — un resultado, estadísticas y alineación de un
+   partido FINAL no cambian nunca más, así que una vez pedido no se
+   vuelve a pedir en toda la semana. 1 hora para búsquedas, 24hs para
+   fichas de equipo.
 4. **`quotaGuard.js` corta antes de las 100** (con margen de seguridad de
    5), pase lo que pase. Si se llega al límite, la API devuelve un 503
    con `quotaExceeded: true` en vez de intentar la request igual.

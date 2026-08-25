@@ -21,7 +21,17 @@ const PAST_MATCHES_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — un día ya j
 const FUTURE_MATCHES_TTL_MS = 6 * 60 * 60 * 1000; // 6 hs — fixture programado, rara vez se mueve
 const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
-const MATCH_DETAIL_TTL_MS = 2 * 60 * 1000; // 2 min — vivo cambia rápido
+const MATCH_DETAIL_TTL_MS = 2 * 60 * 1000; // 2 min — EN VIVO cambia rápido
+const MATCH_DETAIL_FINAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — FINAL no cambia nunca más
+
+// Un partido ya finalizado (resultado, estadísticas, alineación) no
+// cambia nunca más — se cachea casi para siempre, la misma idea que
+// matchesTtlFor() para el feed del día. Uno en vivo o todavía no
+// arrancado sigue con el TTL corto: puede pasar a otro estado en
+// cualquier momento.
+function matchDetailTtlFor(status) {
+  return status === "final" ? MATCH_DETAIL_FINAL_TTL_MS : MATCH_DETAIL_TTL_MS;
+}
 
 const TIMEZONE = process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
 
@@ -143,7 +153,7 @@ app.get("/api/matches/:id", async (req, res) => {
     if (isExpired(key)) {
       console.log(`[api] pidiendo detalle del partido ${id} a API-Football...`);
       const detail = await fetchMatchDetail(id);
-      setCached(key, detail, MATCH_DETAIL_TTL_MS);
+      setCached(key, detail, matchDetailTtlFor(detail.status));
     } else {
       console.log(`[api] sirviendo detalle del partido ${id} desde cache`);
     }
