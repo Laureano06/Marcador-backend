@@ -1,72 +1,78 @@
-# Marcador — backend (de vuelta a API-Football, cuidando el límite de 100/día)
+# Marcador — backend (API-Football, cuidando el límite de 100/día)
 
-Volvimos de ESPN a API-Football (dashboard.api-football.com), esta vez con
-una arquitectura pensada específicamente para el plan free (100
-requests/día).
+Usamos API-Football (dashboard.api-football.com) directo, con una
+arquitectura pensada específicamente para el plan free (100 requests/día,
+10/minuto).
 
 ```
 dataSource.js  →  habla con API-Football
 quotaGuard.js  →  cuenta requests del día, corta antes de llegar a 100
-cache.js       →  cache en memoria genérico, por clave y TTL
+cache.js       →  cache en memoria + disco, por clave y TTL
 server.js      →  la API que consume el frontend
 ```
 
+## Lo que el plan free NO permite (no es un bug, es el límite de la cuenta)
+
+Antes de tocar código acá, dos restricciones reales de API-Football que
+tiraron abajo funciones enteras y no tienen arreglo posible sin pagar un
+plan superior:
+
+- **`/standings` y cualquier `/fixtures?league=X` con rango de fechas o
+  `season`**: el plan free solo da acceso a temporadas **2022 a 2024**,
+  nunca a la actual. Por eso no hay tabla de posiciones ni "partidos de
+  una liga por temporada" en esta versión — se sacaron enteros, no tiene
+  sentido mostrar un dato que la API nunca va a devolver bien.
+- **`/fixtures?team=X` sin un `date` o `id` puntual** también pide
+  `season` (y cae en el mismo bloqueo), y el parámetro `last` está
+  directamente prohibido en el plan free ("Free plans do not have access
+  to the Last parameter"). Por esto **no existe** "últimos partidos" de
+  un equipo en la ficha — literalmente no hay forma de pedirle eso a la
+  API con esta cuenta.
+
+Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
+(un día puntual, sin season), `/fixtures?id=X` (un partido puntual),
+`/fixtures/statistics`, `/fixtures/lineups`, `/predictions?fixture=X`,
+`/teams`, `/players/squads`.
+
 ## Cómo se cuida la cuota
 
-1. **El feed de partidos por día es 1 sola request**, no una por liga.
-   `/fixtures?date=X` trae TODAS las ligas del mundo de una — filtramos
-   por país acá adentro (`INCLUDE_COUNTRIES` en `dataSource.js`).
-2. **La búsqueda de ligas no gasta nada** — filtra una lista fija propia,
-   no le pregunta nada a la API externa.
-3. **El ID numérico de cada liga se resuelve una sola vez**, y se cachea
-   90 días. Es lo único que necesita saber el ID exacto de API-Football
-   (para tabla de posiciones y partidos de una liga puntual) — en vez de
-   adivinar/hardcodear números que pueden estar mal, se busca por
-   nombre+país la primera vez y después se reutiliza casi para siempre.
-4. **TTLs largos en todo**: 1 hora para búsquedas, 24hs para fichas de
-   equipo, 2hs para tablas de posiciones. El feed de partidos por fecha
-   tiene TTL variable según qué tan lejos está esa fecha de hoy: 20 min
-   si es HOY (hay partidos en vivo), 6hs si es una fecha futura (el
-   fixture rara vez se reprograma), y 7 días si ya se jugó (el resultado
-   final no cambia más — no tiene sentido re-pedirlo cada 20 min).
-5. **`quotaGuard.js` corta antes de las 100** (con margen de seguridad de
+1. **El feed de partidos por día es 1 sola request** y trae **todas las
+   ligas del mundo** — no se filtra por país acá adentro. El frontend
+   agrupa lo que llega por continente, juveniles y femenino
+   (`leagueCategories.js`), así que "más ligas" no cuesta una request
+   extra, es el mismo dato de siempre mostrado distinto.
+2. **La búsqueda de ligas no gasta nada** — filtra una lista fija propia
+   (nombre + alias), no le pregunta nada a la API externa.
+3. **TTL variable en el feed de partidos según la fecha**: 20 min si es
+   HOY (hay partidos en vivo), 6hs si es una fecha futura (el fixture
+   rara vez se reprograma), 7 días si ya se jugó (el resultado final no
+   cambia más). 1 hora para búsquedas, 24hs para fichas de equipo, 2 min
+   para detalle de partido.
+4. **`quotaGuard.js` corta antes de las 100** (con margen de seguridad de
    5), pase lo que pase. Si se llega al límite, la API devuelve un 503
-   con `quotaExceeded: true` en vez de intentar la request igual — así la
-   cuenta nunca se pasa del límite real y no corre riesgo de que
-   api-football.com la suspenda de nuevo.
-6. **Límite por minuto, aparte del diario**: el plan free también limita
-   cuántas requests podés mandar por MINUTO (no solo por día). Todas las
-   requests salen espaciadas al menos 6.5s entre sí (`throttledFetch` en
-   `dataSource.js`), y si igual llega a pasar un 429 (límite por minuto
-   superado), se reintenta solo después de una pausa — en vez de fallar
-   directo. **El costo de esto**: la primera vez que alguien ve algo con
-   varias requests (una ficha de equipo, por ejemplo, hace 3), puede
-   tardar 15-20 segundos en cargar en frío. Una vez cacheado, vuelve a
-   ser instantáneo.
-7. **Cache y contador de cuota persistidos a disco** (`data/cache.json`,
+   con `quotaExceeded: true` en vez de intentar la request igual.
+5. **Límite por minuto, aparte del diario**: todas las requests salen
+   espaciadas al menos 6.5s entre sí (`throttledFetch` en
+   `dataSource.js`), y un 429 se reintenta después de una pausa en vez de
+   fallar directo. **Costo de esto**: la primera vez que alguien ve algo
+   con varias requests (un partido con pronóstico + alineación, por
+   ejemplo) puede tardar 15-20 segundos en cargar en frío. Una vez
+   cacheado, vuelve a ser instantáneo.
+6. **Cache y contador de cuota persistidos a disco** (`data/cache.json`,
    `data/quota.json`). Render free duerme el servicio tras inactividad y
    lo reinicia en la próxima visita — sin esto, cada reinicio resetearía
    el contador a 0 (riesgo real de mandar más de 100 requests reales en
-   un día) y vaciaría el cache (recarga en frío innecesaria). El disco
-   sobrevive a reinicios del mismo contenedor, pero no a un redeploy
-   nuevo (Render pisa el filesystem). Si en algún momento hay deploys muy
-   seguidos o se quiere que sobreviva también a eso, el siguiente paso es
-   un disco persistente de Render o Redis (Upstash tiene un free tier que
-   alcanza de sobra para este volumen).
-8. **Fallback a datos viejos ("stale") en todos los endpoints que pegan a
+   un día) y vaciaría el cache. Sobrevive a reinicios del mismo
+   contenedor, pero no a un redeploy nuevo (Render pisa el filesystem) —
+   para eso hace falta un disco persistente de Render o Redis.
+7. **Fallback a datos viejos ("stale") en todos los endpoints que pegan a
    la API externa**: si falla la llamada (cuota agotada, API caída, error
    de red) y hay algo cacheado de antes aunque esté vencido, se devuelve
-   eso con `stale: true` en vez de romper la pantalla. Antes esto solo
-   pasaba en `/api/matches`, `/api/teams/:id` y `/api/matches/:id` — ahora
-   también en `/api/search` y las rutas de liga (`standings`, `matches`).
-9. **Warm-up del feed de hoy al arrancar** (`warmCache()` en
-   `server.js`): apenas levanta el servidor, si el feed de partidos de
-   HOY no está en cache (o ya venció), lo precarga en background sin
-   bloquear que el server empiece a escuchar. Como el cache ahora
-   sobrevive a los reinicios (punto 7), en el caso normal esto no gasta
-   nada — solo actúa cuando de verdad hace falta, evitando que la primera
-   visita después de que Render duerma el servicio tenga que esperar la
-   carga en frío.
+   eso con `stale: true` en vez de romper la pantalla.
+8. **Warm-up del feed de hoy al arrancar** (`warmCache()` en
+   `server.js`): si el feed de HOY no está en cache, lo precarga en
+   background sin bloquear que el server empiece a escuchar. Con el
+   cache persistido (punto 6), en el caso normal esto no gasta nada.
 
 ## Cómo correrlo
 
@@ -77,33 +83,20 @@ server.js      →  la API que consume el frontend
 
 ## Endpoints
 
-- `GET /api/matches?date=YYYY-MM-DD` — 1 request (cacheado 20 min)
+- `GET /api/matches?date=YYYY-MM-DD` — 1 request. TTL variable (ver
+  arriba). Devuelve TODAS las ligas del mundo con partidos ese día.
 - `GET /api/search?q=boca` — 1 request de equipos + búsqueda local de
   ligas (cacheado 1h)
-- `GET /api/teams/:id` — 3 requests (info, plantel, últimos partidos —
-  cacheado 24hs)
-- `GET /api/leagues` — no gasta requests (lista fija)
-- `GET /api/leagues/:slug/standings` — hasta 2 requests la primera vez
-  (resolver ID + tabla), 1 las siguientes veces (ID ya cacheado 90 días).
-  Cacheado 2hs.
-- `GET /api/leagues/:slug/matches` — igual que standings, cacheado 30 min
-- `GET /api/matches/:id` — hasta 3 requests (info + estadísticas si ya
-  arrancó + alineación). Cacheado 2 min.
+- `GET /api/teams/:id` — 2 requests (info + plantel — cacheado 24hs). No
+  incluye "últimos partidos" (ver restricciones arriba).
+- `GET /api/matches/:id` — hasta 4 requests (info + estadísticas si ya
+  arrancó + alineación + pronóstico si todavía no arrancó). Cacheado 2 min.
 - `GET /api/quota` — cuánto se gastó hoy, sin costo
 - `GET /health`
 
-## Si algún día hay que ajustar el límite
+## Si algún día hay que ajustar el límite diario
 
-Si contratás un plan pago con más cuota, solo hay que cambiar
-`API_DAILY_LIMIT` en el `.env` (en Render: Environment → esa variable) —
-no hace falta tocar código.
-
-## Nota sobre la liga de un equipo
-
-Un club puede jugar más de una competencia a la vez (liga local + copa
-internacional). Como API-Football no dice "esta es SU liga principal",
-la inferimos a partir del partido más reciente del equipo (sin gastar
-ninguna request extra, ya la tenemos de la ficha del equipo). Puede fallar
-si el último partido que jugó fue justo de una copa — en ese caso, la
-sección de tabla de posiciones simplemente no aparece en la ficha, en vez
-de mostrar algo incorrecto.
+Si contratás un plan pago con más cuota, cambiá `API_DAILY_LIMIT` en el
+`.env` (en Render: Environment → esa variable). Si el plan pago también
+da acceso a la temporada actual, ahí sí valdría la pena reintroducir
+standings y "últimos partidos" — hoy no es posible con la cuenta free.

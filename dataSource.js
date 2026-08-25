@@ -4,27 +4,25 @@
 //
 // Diseño pensado para el plan free (100 requests/día):
 // - El feed de partidos por día usa /fixtures?date=X, que trae TODAS las
-//   ligas del mundo en UNA sola llamada. Filtramos por país acá adentro,
-//   no le pedimos a la API liga por liga.
+//   ligas del mundo en UNA sola llamada — ya no filtramos por país acá
+//   adentro, el frontend agrupa por continente/juvenil/femenino con lo
+//   que llega.
 // - La búsqueda de ligas es local (no gasta requests): filtramos nuestra
 //   propia lista fija.
-// - Lo único que necesita el ID numérico de liga de API-Football (tabla
-//   de posiciones, partidos de una liga puntual) lo resuelve una vez y
-//   lo cachea casi para siempre (90 días) — no lo volvemos a pedir.
 // - Cada llamada pasa por el "quota guard" (quotaGuard.js), que corta
 //   antes de llegar al límite diario.
+//
+// IMPORTANTE — qué NO se puede hacer en este plan: tabla de posiciones
+// (/standings) y partidos de una liga por temporada (/fixtures?league=X
+// &season=Y) están bloqueados para la temporada actual en el plan free
+// ("Free plans do not have access to this season, try from 2022 to
+// 2024" — error real de la API, no un bug nuestro). Por eso esas
+// funciones no existen acá: no hay forma de arreglarlas con código,
+// hace falta un plan pago de API-Football.
 
 const { canMakeRequest, recordRequest, QuotaExceededError } = require("./quotaGuard");
 
 const BASE_URL = "https://v3.football.api-sports.io";
-
-// Temporada "actual" para los endpoints que la piden (standings,
-// fixtures por liga). API-Football nombra la temporada por el año en que
-// arrancó (la 2026-27 europea es "2026"). Como el año calendario no
-// siempre coincide prolijamente con el arranque de cada torneo, dejamos
-// esto configurable por variable de entorno para no tener que tocar
-// código si hay que ajustarlo.
-const SEASON = Number(process.env.API_FOOTBALL_SEASON || new Date().getFullYear());
 
 // API-Football corta los "días" en UTC por default cuando filtrás por
 // fecha (?date=X, ?from=X&to=Y) — un partido a las 21hs en Argentina
@@ -33,28 +31,8 @@ const SEASON = Number(process.env.API_FOOTBALL_SEASON || new Date().getFullYear(
 // zona horaria cortar los días.
 const TIMEZONE = process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
 
-// País por país, en vez de ID de liga por ID de liga — mucho más difícil
-// de arruinar (ver charla anterior sobre por qué). Cubre lo que se ve en
-// el feed principal de "todas las ligas".
-const INCLUDE_COUNTRIES = [
-  "Argentina",
-  "World",
-  "England",
-  "Spain",
-  "Italy",
-  "Germany",
-  "France",
-  "Brazil",
-  "Portugal",
-  "Netherlands",
-  "Uruguay",
-  "Chile",
-];
-
-// Ligas para el panel lateral / página de liga (tabla + partidos propios).
-// Estas SÍ necesitan un ID numérico de API-Football, que se resuelve la
-// primera vez que se pide cada una (ver resolveLeagueId) y se cachea
-// larguísimo desde server.js.
+// Ligas conocidas para la búsqueda local (searchLeagues, más abajo) — no
+// gasta requests, solo filtra este listado fijo.
 const LEAGUES = [
   // --- Sudamérica ---
   {
@@ -215,10 +193,7 @@ async function fetchMatchesForDate(dateStr) {
     `/fixtures?date=${dateStr}&timezone=${encodeURIComponent(TIMEZONE)}`
   );
 
-  return response
-    .filter((raw) => INCLUDE_COUNTRIES.includes(raw.league.country))
-    .map(normalizeMatch)
-    .sort((a, b) => a.start.localeCompare(b.start));
+  return response.map(normalizeMatch).sort((a, b) => a.start.localeCompare(b.start));
 }
 
 // Busca equipos por nombre. 1 request por texto de búsqueda (se cachea
@@ -233,10 +208,15 @@ async function searchTeams(query) {
   }));
 }
 
-// Búsqueda de ligas: NO gasta requests — filtra nuestra propia lista fija.
+// Búsqueda de ligas: NO gasta requests — filtra nuestra propia lista fija,
+// por nombre de display o por cualquiera de sus alias.
 function searchLeagues(query) {
   const q = query.toLowerCase();
-  return LEAGUES.filter((l) => l.name.toLowerCase().includes(q)).map((l) => ({
+  return LEAGUES.filter(
+    (l) =>
+      l.name.toLowerCase().includes(q) ||
+      (l.aliases || []).some((a) => a.toLowerCase().includes(q))
+  ).map((l) => ({
     id: l.slug,
     name: l.name,
     country: l.country,
@@ -244,104 +224,20 @@ function searchLeagues(query) {
   }));
 }
 
-// Resuelve el ID numérico de API-Football para una de nuestras ligas
-// configuradas (por nombre + país). Se llama UNA vez por liga — el
-// resultado se cachea larguísimo desde server.js, así que en la práctica
-// esto se paga una sola vez por liga, para siempre.
+// Ficha de equipo: info + plantel. 2 requests, cacheado 24hs desde
+// server.js.
 //
-// Ojo: /leagues ya no acepta `country` y `search` juntos ("The Country
-// field cannot be used with the Search field") — antes funcionaba y dejó
-// de andar sin previo aviso de API-Football. Por eso buscamos solo por
-// nombre y filtramos por país acá adentro.
-//
-// Además probamos `name` y, si no da nada, cada uno de los `aliases`: el
-// nombre "de display" que usamos (ej. "Liga de Primera" para Chile) puede
-// no coincidir con cómo lo tiene cargado API-Football todavía (ellos
-// siguen usando "Primera División" ahí, aunque el torneo se rebrandeó
-// hace rato en la vida real).
-async function resolveLeagueId(league) {
-  const searchTerms = [league.name, ...(league.aliases || [])].filter(
-    (term, i, arr) => arr.indexOf(term) === i
-  );
-
-  for (const term of searchTerms) {
-    const response = await apiGet(`/leagues?search=${encodeURIComponent(term)}`);
-    const pool =
-      league.country === "World"
-        ? response
-        : response.filter((r) => r.country?.name === league.country);
-
-    if (pool.length === 0) continue;
-
-    // Preferimos una coincidencia de nombre exacta (insensible a
-    // mayúsculas) contra el término que dio resultado; si no hay, nos
-    // quedamos con el primero del país correcto.
-    const exact = pool.find((r) => r.league.name.toLowerCase() === term.toLowerCase());
-    return (exact || pool[0]).league.id;
-  }
-
-  console.error(
-    `[dataSource] no se encontró la liga "${league.name}" (${league.country}) en API-Football`
-  );
-  return null;
-}
-
-// Tabla de posiciones completa de una liga (ya resuelto su ID numérico).
-async function fetchLeagueStandings(leagueId) {
-  try {
-    const response = await apiGet(
-      `/standings?league=${leagueId}&season=${SEASON}`
-    );
-    const table = response[0]?.league?.standings?.[0];
-    if (!table) return null;
-
-    return table.map((row) => ({
-      teamId: row.team.id,
-      teamName: row.team.name,
-      crest: row.team.logo || null,
-      rank: row.rank,
-      played: row.all.played,
-      wins: row.all.win,
-      draws: row.all.draw,
-      losses: row.all.lose,
-      goalsFor: row.all.goals.for,
-      goalsAgainst: row.all.goals.against,
-      points: row.points,
-    }));
-  } catch (err) {
-    // Copas eliminatorias u otras competencias sin tabla de posiciones
-    // devuelven una respuesta vacía — no es un error real.
-    console.error(`[dataSource] no se pudo obtener tabla de liga ${leagueId}:`, err.message);
-    return null;
-  }
-}
-
-// Partidos de UNA liga en una ventana de fechas (para la pestaña
-// "Partidos" de la página de liga).
-async function fetchLeagueMatches(leagueId, daysPast = 7, daysFuture = 14) {
-  const today = new Date();
-  const from = new Date(today);
-  from.setDate(from.getDate() - daysPast);
-  const to = new Date(today);
-  to.setDate(to.getDate() + daysFuture);
-
-  const iso = (d) => d.toISOString().slice(0, 10);
-
-  const response = await apiGet(
-    `/fixtures?league=${leagueId}&season=${SEASON}&from=${iso(from)}&to=${iso(to)}&timezone=${encodeURIComponent(TIMEZONE)}`
-  );
-
-  return response.map(normalizeMatch).sort((a, b) => a.start.localeCompare(b.start));
-}
-
-// Ficha de equipo: info + plantel + últimos 5 partidos jugados.
-// 3 requests (info, plantel, últimos partidos) — cacheado 24hs desde
-// server.js, así que es barato en la práctica.
+// IMPORTANTE: "últimos partidos" (recentForm) YA NO EXISTE ACÁ. Usaba
+// /fixtures?team=X&last=5, y el plan free bloqueó el parámetro "last"
+// ("Free plans do not have access to the Last parameter") — y no hay
+// vuelta: CUALQUIER /fixtures?team=X sin un "date" o "id" puntual pide
+// season, y season de la temporada actual también está bloqueada en
+// este plan (mismo problema que standings). No es un bug, es el límite
+// real de la cuenta gratuita.
 async function fetchTeamProfile(teamId) {
-  const [infoRes, squadRes, recentFixturesRes] = await Promise.all([
+  const [infoRes, squadRes] = await Promise.all([
     apiGet(`/teams?id=${teamId}`),
     apiGet(`/players/squads?team=${teamId}`),
-    apiGet(`/fixtures?team=${teamId}&last=5`),
   ]);
 
   const info = infoRes[0];
@@ -356,48 +252,12 @@ async function fetchTeamProfile(teamId) {
     photo: p.photo || null,
   }));
 
-  const recentForm = recentFixturesRes
-    .filter((f) => ["FT", "AET", "PEN"].includes(f.fixture.status.short))
-    .map((f) => {
-      const isHome = f.teams.home.id === Number(teamId);
-      const goalsFor = isHome ? f.goals.home : f.goals.away;
-      const goalsAgainst = isHome ? f.goals.away : f.goals.home;
-      const opponent = isHome ? f.teams.away.name : f.teams.home.name;
-
-      let result = "E";
-      if (goalsFor > goalsAgainst) result = "G";
-      if (goalsFor < goalsAgainst) result = "P";
-
-      return {
-        opponent,
-        goalsFor,
-        goalsAgainst,
-        result,
-        date: f.fixture.date,
-        league: f.league.name,
-      };
-    })
-    .sort((a, b) => b.date.localeCompare(a.date));
-
-  // No hay un endpoint que diga "la liga principal de este equipo" —
-  // un club puede jugar varias competencias a la vez (liga local + copa
-  // internacional, por ejemplo). Usamos el partido más reciente como
-  // mejor estimación de su liga "de todos los días", matcheando el
-  // nombre contra nuestra lista configurada. No cuesta ninguna request
-  // extra: ya tenemos recentForm de arriba.
-  const guessedLeagueName = recentForm[0]?.league;
-  const matchedLeague = guessedLeagueName
-    ? LEAGUES.find((l) => l.name.toLowerCase() === guessedLeagueName.toLowerCase())
-    : null;
-
   return {
     id: info.team.id,
     name: info.team.name,
     country: info.team.country,
     founded: info.team.founded || null,
     crest: info.team.logo || null,
-    leagueSlug: matchedLeague?.slug || null,
-    leagueName: matchedLeague?.name || null,
     venue: info.venue
       ? {
           name: info.venue.name || null,
@@ -407,13 +267,35 @@ async function fetchTeamProfile(teamId) {
         }
       : null,
     squad,
-    recentForm,
   };
 }
 
+// Pronóstico (% local/empate/visitante) para un partido puntual. Solo
+// tiene sentido antes de que arranque — confirmado que el plan free SÍ
+// da acceso a este endpoint (a diferencia de standings).
+async function fetchPredictions(matchId) {
+  try {
+    const response = await apiGet(`/predictions?fixture=${matchId}`);
+    const pred = response[0]?.predictions;
+    if (!pred?.percent) return null;
+
+    const toNumber = (s) => (s ? parseFloat(s.replace("%", "")) : null);
+    const home = toNumber(pred.percent.home);
+    const draw = toNumber(pred.percent.draw);
+    const away = toNumber(pred.percent.away);
+    if (home == null || draw == null || away == null) return null;
+
+    return { home, draw, away, advice: pred.advice || null };
+  } catch (err) {
+    console.error(`[dataSource] no se pudo obtener pronóstico del partido ${matchId}:`, err.message);
+    return null;
+  }
+}
+
 // Detalle de UN partido: info base (1 request) + estadísticas (1, solo si
-// ya arrancó) + alineación (1, real o probable según el momento). Hasta
-// 3 requests, cacheado 2 min desde server.js.
+// ya arrancó) + alineación (1, real o probable según el momento) +
+// pronóstico (1, solo si todavía no arrancó). Hasta 4 requests, cacheado
+// 2 min desde server.js.
 async function fetchMatchDetail(matchId) {
   const infoRes = await apiGet(`/fixtures?id=${matchId}`);
   const info = infoRes[0];
@@ -441,6 +323,11 @@ async function fetchMatchDetail(matchId) {
   try {
     const lineupsRes = await apiGet(`/fixtures/lineups?fixture=${matchId}`);
     if (lineupsRes.length === 2) {
+      // "grid" viene como "fila:columna" (fila 1 = arquero, crece hacia
+      // adelante) — es lo que el frontend usa para dibujar la cancha con
+      // cada titular en su posición real. No todas las ligas la tienen
+      // cargada; cuando falta, el frontend arma las filas a partir de la
+      // formación ("4-4-2") como respaldo.
       const buildSide = (side) => ({
         teamId: side.team.id,
         teamName: side.team.name,
@@ -450,6 +337,7 @@ async function fetchMatchDetail(matchId) {
           name: p.player.name,
           number: p.player.number,
           position: p.player.pos,
+          grid: p.player.grid || null,
         })),
       });
       const home = lineupsRes.find((s) => s.team.id === info.teams.home.id);
@@ -461,6 +349,8 @@ async function fetchMatchDetail(matchId) {
   } catch (err) {
     console.error(`[dataSource] no se pudo obtener alineación del partido ${matchId}:`, err.message);
   }
+
+  const predictions = status === "scheduled" ? await fetchPredictions(matchId) : null;
 
   return {
     id: matchId,
@@ -481,6 +371,7 @@ async function fetchMatchDetail(matchId) {
     statistics,
     lineups,
     lineupsAreProbable: status === "scheduled",
+    predictions,
   };
 }
 
@@ -488,9 +379,6 @@ module.exports = {
   fetchMatchesForDate,
   searchTeams,
   searchLeagues,
-  resolveLeagueId,
-  fetchLeagueStandings,
-  fetchLeagueMatches,
   fetchTeamProfile,
   fetchMatchDetail,
   LEAGUES,

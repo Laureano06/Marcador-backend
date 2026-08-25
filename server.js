@@ -5,12 +5,8 @@ const {
   fetchMatchesForDate,
   searchTeams,
   searchLeagues,
-  resolveLeagueId,
-  fetchLeagueStandings,
-  fetchLeagueMatches,
   fetchTeamProfile,
   fetchMatchDetail,
-  LEAGUES,
 } = require("./dataSource");
 const { getCached, getCachedMeta, setCached, isExpired } = require("./cache");
 const { getUsage, QuotaExceededError } = require("./quotaGuard");
@@ -25,10 +21,7 @@ const PAST_MATCHES_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — un día ya j
 const FUTURE_MATCHES_TTL_MS = 6 * 60 * 60 * 1000; // 6 hs — fixture programado, rara vez se mueve
 const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
-const STANDINGS_TTL_MS = 2 * 60 * 60 * 1000; // 2 hs
-const LEAGUE_MATCHES_TTL_MS = 30 * 60 * 1000; // 30 min
 const MATCH_DETAIL_TTL_MS = 2 * 60 * 1000; // 2 min — vivo cambia rápido
-const LEAGUE_ID_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 días — esto no cambia nunca
 
 const TIMEZONE = process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
 
@@ -64,19 +57,6 @@ function handleError(res, err, fallback) {
   console.error("[api] error:", err.message);
   if (fallback) return res.json(fallback);
   res.status(502).json({ error: "No se pudo obtener datos de API-Football" });
-}
-
-// Resuelve (y cachea casi para siempre) el ID numérico de una liga
-// configurada. Devuelve null si no se pudo resolver, sin tirar error —
-// el llamador decide qué hacer con eso.
-async function getLeagueId(league) {
-  const key = `league-id:${league.slug}`;
-  if (isExpired(key)) {
-    const id = await resolveLeagueId(league);
-    if (id) setCached(key, id, LEAGUE_ID_TTL_MS);
-    return id;
-  }
-  return getCached(key);
 }
 
 // GET /api/matches?date=2026-08-16
@@ -151,74 +131,6 @@ app.get("/api/teams/:id", async (req, res) => {
   } catch (err) {
     const stale = getCached(key);
     handleError(res, err, stale && { ...stale, stale: true });
-  }
-});
-
-// GET /api/leagues -> lista fija, no gasta requests.
-app.get("/api/leagues", (_req, res) => {
-  res.json(LEAGUES.map(({ slug, name, region }) => ({ slug, name, region })));
-});
-
-// GET /api/leagues/:slug/standings
-app.get("/api/leagues/:slug/standings", async (req, res) => {
-  const { slug } = req.params;
-  const league = LEAGUES.find((l) => l.slug === slug);
-  if (!league) return res.status(404).json({ error: "Liga no encontrada" });
-
-  const key = `standings:${slug}`;
-  try {
-    if (isExpired(key)) {
-      const leagueId = await getLeagueId(league);
-      if (!leagueId) {
-        setCached(key, null, STANDINGS_TTL_MS);
-      } else {
-        console.log(`[api] pidiendo tabla de ${slug} a API-Football...`);
-        const table = await fetchLeagueStandings(leagueId);
-        setCached(key, table, STANDINGS_TTL_MS);
-      }
-    } else {
-      console.log(`[api] sirviendo tabla de ${slug} desde cache`);
-    }
-    res.json({ standings: getCached(key) });
-  } catch (err) {
-    const stale = getCached(key);
-    handleError(res, err, stale !== null && { standings: stale, stale: true });
-  }
-});
-
-// GET /api/leagues/:slug/matches
-app.get("/api/leagues/:slug/matches", async (req, res) => {
-  const { slug } = req.params;
-  const league = LEAGUES.find((l) => l.slug === slug);
-  if (!league) return res.status(404).json({ error: "Liga no encontrada" });
-
-  const key = `league-matches:${slug}`;
-  try {
-    if (isExpired(key)) {
-      const leagueId = await getLeagueId(league);
-      if (!leagueId) {
-        setCached(key, [], LEAGUE_MATCHES_TTL_MS);
-      } else {
-        console.log(`[api] pidiendo partidos de ${slug} a API-Football...`);
-        const matches = await fetchLeagueMatches(leagueId);
-        setCached(key, matches, LEAGUE_MATCHES_TTL_MS);
-      }
-    } else {
-      console.log(`[api] sirviendo partidos de ${slug} desde cache`);
-    }
-    const meta = getCachedMeta(key);
-    res.json({ updatedAt: new Date(meta.updatedAt).toISOString(), matches: meta.data });
-  } catch (err) {
-    const stale = getCachedMeta(key);
-    handleError(
-      res,
-      err,
-      stale && {
-        updatedAt: new Date(stale.updatedAt).toISOString(),
-        matches: stale.data,
-        stale: true,
-      }
-    );
   }
 });
 
