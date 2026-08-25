@@ -3,10 +3,45 @@
 // por día, resultados de búsqueda, y fichas de equipo — cada uno con un
 // TTL distinto, porque no todos cambian con la misma frecuencia.
 //
-// En producción esto se reemplaza por Redis (mismo concepto de TTL, pero
-// persistente entre reinicios).
+// Además se persiste a disco (data/cache.json). Con solo 100 requests/día,
+// perder el cache en cada reinicio (Render free duerme el servicio tras
+// ~15 min de inactividad y lo revive en la siguiente visita) significaba
+// re-pedir todo en frío y gastar cuota de nuevo aunque el dato ya estuviera
+// fresco un minuto antes. Para un uso pago/con más tráfico, esto se
+// reemplaza por Redis (mismo concepto de TTL, pero persistente de verdad
+// entre despliegues, no solo entre reinicios del mismo contenedor).
 
-const store = {}; // { key: { updatedAt, ttlMs, data } }
+const fs = require("fs");
+const path = require("path");
+
+const DATA_DIR = path.join(__dirname, "data");
+const CACHE_FILE = path.join(DATA_DIR, "cache.json");
+
+let store = {}; // { key: { updatedAt, ttlMs, data } }
+
+function loadFromDisk() {
+  try {
+    const raw = fs.readFileSync(CACHE_FILE, "utf8");
+    store = JSON.parse(raw);
+    console.log(`[cache] restaurado desde disco (${Object.keys(store).length} claves)`);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.warn("[cache] no se pudo leer cache.json, arranco vacío:", err.message);
+    }
+    store = {};
+  }
+}
+
+function saveToDisk() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(store));
+  } catch (err) {
+    console.warn("[cache] no se pudo persistir a disco:", err.message);
+  }
+}
+
+loadFromDisk();
 
 function getCached(key) {
   const entry = store[key];
@@ -19,6 +54,7 @@ function getCachedMeta(key) {
 
 function setCached(key, data, ttlMs) {
   store[key] = { updatedAt: Date.now(), ttlMs, data };
+  saveToDisk();
 }
 
 function isExpired(key) {

@@ -4,11 +4,21 @@
 // seguridad — así nunca mandamos la request #101 y arriesgamos la cuenta
 // de nuevo.
 //
-// Nota: el contador vive en memoria. Si el proceso se reinicia (deploy,
-// que Render lo duerma, etc.), se resetea a 0 aunque no sea medianoche
-// todavía. Para un uso normal de un proyecto personal esto es aceptable
-// — en el peor caso, subestimamos cuánto gastamos, nunca lo sobreestimamos
-// de forma peligrosa.
+// El contador se persiste a disco (data/quota.json). Es crítico: Render
+// free duerme el servicio tras inactividad y lo reinicia en la próxima
+// visita, y si el contador viviera solo en memoria, cada reinicio lo
+// resetearía a 0 aunque el día siguiera siendo el mismo — eso podría
+// hacernos mandar de verdad más de 100 requests reales en un día y
+// arriesgar que api-football.com suspenda la cuenta otra vez. Con el
+// contador en disco, sobrevive a los reinicios del mismo contenedor
+// (no a un redeploy nuevo, que sí pisa el disco — para eso hace falta
+// un disco persistente de Render o migrar a Redis).
+
+const fs = require("fs");
+const path = require("path");
+
+const DATA_DIR = path.join(__dirname, "data");
+const QUOTA_FILE = path.join(DATA_DIR, "quota.json");
 
 const DAILY_LIMIT = Number(process.env.API_DAILY_LIMIT || 100);
 const SAFETY_MARGIN = 5; // dejamos de pedir un poco antes del límite real
@@ -20,11 +30,39 @@ function todayKey() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function loadFromDisk() {
+  try {
+    const raw = fs.readFileSync(QUOTA_FILE, "utf8");
+    const saved = JSON.parse(raw);
+    if (saved.date === todayKey()) {
+      count = saved.count || 0;
+      countDate = saved.date;
+      console.log(`[quota] restaurado desde disco: ${count}/${DAILY_LIMIT} usados hoy`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.warn("[quota] no se pudo leer quota.json, arranco en 0:", err.message);
+    }
+  }
+}
+
+function saveToDisk() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(QUOTA_FILE, JSON.stringify({ date: countDate, count }));
+  } catch (err) {
+    console.warn("[quota] no se pudo persistir a disco:", err.message);
+  }
+}
+
+loadFromDisk();
+
 function resetIfNewDay() {
   const today = todayKey();
   if (today !== countDate) {
     countDate = today;
     count = 0;
+    saveToDisk();
   }
 }
 
@@ -36,6 +74,7 @@ function canMakeRequest() {
 function recordRequest() {
   resetIfNewDay();
   count++;
+  saveToDisk();
   if (count === DAILY_LIMIT - SAFETY_MARGIN) {
     console.warn(
       `[quota] llegamos a ${count}/${DAILY_LIMIT} requests hoy — a partir de acá se corta para no pasarnos.`

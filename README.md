@@ -23,8 +23,12 @@ server.js      →  la API que consume el frontend
    (para tabla de posiciones y partidos de una liga puntual) — en vez de
    adivinar/hardcodear números que pueden estar mal, se busca por
    nombre+país la primera vez y después se reutiliza casi para siempre.
-4. **TTLs largos en todo**: 20 min para partidos del día, 1 hora para
-   búsquedas, 24hs para fichas de equipo, 2hs para tablas de posiciones.
+4. **TTLs largos en todo**: 1 hora para búsquedas, 24hs para fichas de
+   equipo, 2hs para tablas de posiciones. El feed de partidos por fecha
+   tiene TTL variable según qué tan lejos está esa fecha de hoy: 20 min
+   si es HOY (hay partidos en vivo), 6hs si es una fecha futura (el
+   fixture rara vez se reprograma), y 7 días si ya se jugó (el resultado
+   final no cambia más — no tiene sentido re-pedirlo cada 20 min).
 5. **`quotaGuard.js` corta antes de las 100** (con margen de seguridad de
    5), pase lo que pase. Si se llega al límite, la API devuelve un 503
    con `quotaExceeded: true` en vez de intentar la request igual — así la
@@ -39,6 +43,30 @@ server.js      →  la API que consume el frontend
    varias requests (una ficha de equipo, por ejemplo, hace 3), puede
    tardar 15-20 segundos en cargar en frío. Una vez cacheado, vuelve a
    ser instantáneo.
+7. **Cache y contador de cuota persistidos a disco** (`data/cache.json`,
+   `data/quota.json`). Render free duerme el servicio tras inactividad y
+   lo reinicia en la próxima visita — sin esto, cada reinicio resetearía
+   el contador a 0 (riesgo real de mandar más de 100 requests reales en
+   un día) y vaciaría el cache (recarga en frío innecesaria). El disco
+   sobrevive a reinicios del mismo contenedor, pero no a un redeploy
+   nuevo (Render pisa el filesystem). Si en algún momento hay deploys muy
+   seguidos o se quiere que sobreviva también a eso, el siguiente paso es
+   un disco persistente de Render o Redis (Upstash tiene un free tier que
+   alcanza de sobra para este volumen).
+8. **Fallback a datos viejos ("stale") en todos los endpoints que pegan a
+   la API externa**: si falla la llamada (cuota agotada, API caída, error
+   de red) y hay algo cacheado de antes aunque esté vencido, se devuelve
+   eso con `stale: true` en vez de romper la pantalla. Antes esto solo
+   pasaba en `/api/matches`, `/api/teams/:id` y `/api/matches/:id` — ahora
+   también en `/api/search` y las rutas de liga (`standings`, `matches`).
+9. **Warm-up del feed de hoy al arrancar** (`warmCache()` en
+   `server.js`): apenas levanta el servidor, si el feed de partidos de
+   HOY no está en cache (o ya venció), lo precarga en background sin
+   bloquear que el server empiece a escuchar. Como el cache ahora
+   sobrevive a los reinicios (punto 7), en el caso normal esto no gasta
+   nada — solo actúa cuando de verdad hace falta, evitando que la primera
+   visita después de que Render duerma el servicio tenga que esperar la
+   carga en frío.
 
 ## Cómo correrlo
 
