@@ -1,66 +1,42 @@
-// Cache en memoria genérico: cualquier módulo puede guardar algo bajo una
-// clave, con su propio tiempo de vencimiento (TTL). Se usa para partidos
-// por día, resultados de búsqueda, y fichas de equipo — cada uno con un
-// TTL distinto, porque no todos cambian con la misma frecuencia.
+// Cache genérico: cualquier módulo puede guardar algo bajo una clave, con
+// su propio tiempo de vencimiento (TTL). Se usa para partidos por día,
+// resultados de búsqueda, y fichas de equipo — cada uno con un TTL
+// distinto, porque no todos cambian con la misma frecuencia.
 //
-// Además se persiste a disco (data/cache.json). Con solo 100 requests/día,
-// perder el cache en cada reinicio (Render free duerme el servicio tras
-// ~15 min de inactividad y lo revive en la siguiente visita) significaba
-// re-pedir todo en frío y gastar cuota de nuevo aunque el dato ya estuviera
-// fresco un minuto antes. Para un uso pago/con más tráfico, esto se
-// reemplaza por Redis (mismo concepto de TTL, pero persistente de verdad
-// entre despliegues, no solo entre reinicios del mismo contenedor).
+// Respaldado por SQLite (ver db.js) en vez de un JSON plano reescrito
+// entero en cada set. Mismo concepto (clave -> {data, updatedAt, ttlMs}) y
+// misma interfaz pública — server.js y dataSource.js no necesitan tocarse.
 
-const fs = require("fs");
-const path = require("path");
+const db = require("./db");
 
-const DATA_DIR = path.join(__dirname, "data");
-const CACHE_FILE = path.join(DATA_DIR, "cache.json");
-
-let store = {}; // { key: { updatedAt, ttlMs, data } }
-
-function loadFromDisk() {
-  try {
-    const raw = fs.readFileSync(CACHE_FILE, "utf8");
-    store = JSON.parse(raw);
-    console.log(`[cache] restaurado desde disco (${Object.keys(store).length} claves)`);
-  } catch (err) {
-    if (err.code !== "ENOENT") {
-      console.warn("[cache] no se pudo leer cache.json, arranco vacío:", err.message);
-    }
-    store = {};
-  }
-}
-
-function saveToDisk() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(store));
-  } catch (err) {
-    console.warn("[cache] no se pudo persistir a disco:", err.message);
-  }
-}
-
-loadFromDisk();
+const stmtGet = db.prepare("SELECT updatedAt, ttlMs, data FROM cache WHERE key = ?");
+const stmtSet = db.prepare(`
+  INSERT INTO cache (key, updatedAt, ttlMs, data) VALUES (@key, @updatedAt, @ttlMs, @data)
+  ON CONFLICT(key) DO UPDATE SET
+    updatedAt = excluded.updatedAt,
+    ttlMs = excluded.ttlMs,
+    data = excluded.data
+`);
 
 function getCached(key) {
-  const entry = store[key];
-  return entry ? entry.data : null;
+  const row = stmtGet.get(key);
+  return row ? JSON.parse(row.data) : null;
 }
 
 function getCachedMeta(key) {
-  return store[key] || null; // incluye updatedAt, útil para mostrar "actualizado hace..."
+  const row = stmtGet.get(key);
+  if (!row) return null;
+  return { updatedAt: row.updatedAt, ttlMs: row.ttlMs, data: JSON.parse(row.data) }; // incluye updatedAt, útil para mostrar "actualizado hace..." y para Cache-Control
 }
 
 function setCached(key, data, ttlMs) {
-  store[key] = { updatedAt: Date.now(), ttlMs, data };
-  saveToDisk();
+  stmtSet.run({ key, updatedAt: Date.now(), ttlMs, data: JSON.stringify(data) });
 }
 
 function isExpired(key) {
-  const entry = store[key];
-  if (!entry) return true;
-  return Date.now() - entry.updatedAt > entry.ttlMs;
+  const row = stmtGet.get(key);
+  if (!row) return true;
+  return Date.now() - row.updatedAt > row.ttlMs;
 }
 
 module.exports = { getCached, getCachedMeta, setCached, isExpired };

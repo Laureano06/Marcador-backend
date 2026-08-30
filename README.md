@@ -7,8 +7,9 @@ arquitectura pensada específicamente para el plan free (100 requests/día,
 ```
 dataSource.js  →  habla con API-Football
 quotaGuard.js  →  cuenta requests del día, corta antes de llegar a 100
-cache.js       →  cache en memoria + disco, por clave y TTL
-server.js      →  la API que consume el frontend
+cache.js       →  cache en memoria + SQLite (db.js), por clave y TTL
+db.js          →  conexión SQLite compartida (data/store.db, modo WAL)
+server.js      →  la API que consume el frontend (gzip, rate limit, Cache-Control)
 ```
 
 ## Lo que el plan free NO permite (no es un bug, es el límite de la cuenta)
@@ -63,13 +64,20 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
    con varias requests (un partido con pronóstico + alineación, por
    ejemplo) puede tardar 15-20 segundos en cargar en frío. Una vez
    cacheado, vuelve a ser instantáneo.
-6. **Cache y contador de cuota persistidos a disco** (`data/cache.json`,
-   `data/quota.json`). Render free duerme el servicio tras inactividad y
-   lo reinicia en la próxima visita — sin esto, cada reinicio resetearía
-   el contador a 0 (riesgo real de mandar más de 100 requests reales en
-   un día) y vaciaría el cache. Sobrevive a reinicios del mismo
-   contenedor, pero no a un redeploy nuevo (Render pisa el filesystem) —
-   para eso hace falta un disco persistente de Render o Redis.
+6. **Cache y contador de cuota persistidos en SQLite** (`data/store.db`,
+   modo WAL, ver `db.js`). Antes eran dos archivos JSON reescritos
+   enteros en cada escritura (`data/cache.json`, `data/quota.json`) — se
+   migran solos a la base la primera vez que corre esta versión, no hace
+   falta tocar nada a mano. Sigue siendo necesario por lo mismo de
+   siempre: Render free duerme el servicio tras inactividad y lo reinicia
+   en la próxima visita — sin persistencia, cada reinicio resetearía el
+   contador a 0 (riesgo real de mandar más de 100 requests reales en un
+   día) y vaciaría el cache. SQLite sobrevive a reinicios del mismo
+   contenedor igual que el JSON viejo, con escrituras atómicas por fila
+   en vez de reescribir todo el archivo — pero **tampoco sobrevive a un
+   redeploy nuevo** (Render pisa el filesystem igual). Para eso hace
+   falta un disco persistente de Render (montado en `data/`) o migrar a
+   un servicio externo (Turso/LibSQL, Redis).
 7. **Fallback a datos viejos ("stale") en todos los endpoints que pegan a
    la API externa**: si falla la llamada (cuota agotada, API caída, error
    de red) y hay algo cacheado de antes aunque esté vencido, se devuelve
@@ -89,6 +97,18 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
    margen de seguridad las corte solo. Con esto, en cuanto la API
    contesta ese error una vez, el proceso entero corta para el resto del
    día.
+
+10. **Respuestas comprimidas (gzip)** — el feed de partidos de un día
+    con muchas ligas puede pesar varios KB de JSON; con `compression`
+    baja bastante en el aire, se nota sobre todo en 3G/4G.
+11. **Rate limiting por IP** (`express-rate-limit`, 60 req/min en
+    `/api/*`) — no protege la cuota en sí (eso lo hace quotaGuard, y
+    pegarle a un endpoint cacheado no gasta requests reales), pero evita
+    que un cliente en loop o un bot generen carga innecesaria.
+12. **`Cache-Control` en las respuestas**, con el tiempo de vida restante
+    real del dato cacheado (no el TTL completo) — el browser (y
+    cualquier CDN en el medio) puede reusar la respuesta sin volver a
+    pegarle al backend, bajando también la carga ahí.
 
    **Nota real de esta build**: hoy el límite diario real se agotó en
    medio del desarrollo — no por tráfico de usuarios, sino por las

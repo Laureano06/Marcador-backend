@@ -1,6 +1,8 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
+const rateLimit = require("express-rate-limit");
 const {
   fetchMatchesForDate,
   searchTeams,
@@ -13,6 +15,20 @@ const { getUsage, QuotaExceededError } = require("./quotaGuard");
 
 const app = express();
 app.use(cors());
+app.use(compression()); // gzip de las respuestas — el feed de partidos por día puede ser varios KB de JSON con muchas ligas; en 3G/4G esto se nota
+
+// Rate limit liviano por IP. No cuida la cuota de API-Football directamente
+// (eso lo hace quotaGuard — pegarle en loop a un endpoint cacheado no gasta
+// requests reales), pero evita que un cliente en loop o un bot generen
+// carga innecesaria en el servidor.
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas requests, esperá un momento." },
+});
+app.use("/api/", apiLimiter);
 
 // TTLs pensados para el límite de 100 requests/día. Cuanto más caro es un
 // dato de conseguir (o más lento cambia), más tiempo lo reutilizamos.
@@ -59,6 +75,19 @@ function matchesTtlFor(dateStr) {
   return MATCHES_TTL_MS;
 }
 
+// Le dice al browser (y a cualquier CDN/proxy en el medio) cuánto puede
+// reusar esta respuesta sin volver a pedirla — la misma ventana que ya
+// usa nuestro cache interno, para no mentirle al cliente. "remaining" es
+// lo que le queda de vida al dato cacheado AHORA, no el TTL completo: si
+// el dato tiene 15 de sus 20 min ya gastados, el cliente solo debería
+// guardarlo 5 min más.
+function setCacheHeaders(res, meta) {
+  if (!meta) return;
+  const remainingMs = meta.ttlMs - (Date.now() - meta.updatedAt);
+  const maxAge = Math.max(0, Math.floor(remainingMs / 1000));
+  res.set("Cache-Control", `public, max-age=${maxAge}`);
+}
+
 function handleError(res, err, fallback) {
   if (err instanceof QuotaExceededError) {
     console.warn("[api] cuota agotada:", err.message);
@@ -86,6 +115,7 @@ app.get("/api/matches", async (req, res) => {
       console.log(`[api] sirviendo partidos de ${date} desde cache`);
     }
     const meta = getCachedMeta(key);
+    setCacheHeaders(res, meta);
     res.json({ updatedAt: new Date(meta.updatedAt).toISOString(), matches: meta.data });
   } catch (err) {
     const stale = getCachedMeta(key);
@@ -118,6 +148,7 @@ app.get("/api/search", async (req, res) => {
     } else {
       console.log(`[api] sirviendo búsqueda "${q}" desde cache`);
     }
+    setCacheHeaders(res, getCachedMeta(key));
     res.json(getCached(key));
   } catch (err) {
     const stale = getCached(key);
@@ -137,6 +168,7 @@ app.get("/api/teams/:id", async (req, res) => {
     } else {
       console.log(`[api] sirviendo ficha del equipo ${id} desde cache`);
     }
+    setCacheHeaders(res, getCachedMeta(key));
     res.json(getCached(key));
   } catch (err) {
     const stale = getCached(key);
@@ -157,6 +189,7 @@ app.get("/api/matches/:id", async (req, res) => {
     } else {
       console.log(`[api] sirviendo detalle del partido ${id} desde cache`);
     }
+    setCacheHeaders(res, getCachedMeta(key));
     res.json(getCached(key));
   } catch (err) {
     const stale = getCached(key);
@@ -166,10 +199,14 @@ app.get("/api/matches/:id", async (req, res) => {
 
 // GET /api/quota -> transparencia sobre cuánto llevamos gastado hoy.
 app.get("/api/quota", (_req, res) => {
+  res.set("Cache-Control", "no-store"); // siempre fresco: no cuesta nada, es solo un contador local
   res.json(getUsage());
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ ok: true });
+});
 
 // Precarga el feed de partidos de HOY al arrancar, en background, sin
 // bloquear que el servidor empiece a escuchar. Render duerme el servicio
