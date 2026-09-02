@@ -159,15 +159,22 @@ async function apiGet(path, retriesLeft = 2) {
       markExhausted();
       throw new QuotaExceededError();
     }
-    // Cualquier otro error trae un problema DE LA CUENTA, no de cuota:
-    // "access" es el que devuelve una cuenta suspendida ("Your account is
-    // suspended, check on https://dashboard.api-football.com."), pero
-    // cortamos igual ante cualquier clave que no sea "requests" — ninguna
-    // se arregla reintentando, y sin este corte seguiríamos gastando el
-    // contador local y golpeando la cuenta en cada cache-miss.
-    const reason = Object.values(data.errors)[0];
-    markAccountBlocked(reason);
-    throw new AccountBlockedError(reason);
+    // OJO: solo "access" y "token" son problemas DE LA CUENTA de verdad
+    // (suspendida, key inválida/faltante) — esos afectan CUALQUIER llamada
+    // por igual, así que ahí sí tiene sentido cortar todo por un rato.
+    // Cualquier otra clave (ej. "date", "season", "league") es una
+    // restricción del plan free sobre ESE pedido puntual — como el límite
+    // de temporada en standings, que ya sabíamos que existía. Bloquear
+    // TODO por un error de una fecha puntual fue un bug: dejaba search,
+    // ficha de equipo y detalle de partido rotos con un mensaje que ni
+    // siquiera correspondía a lo que esos endpoints estaban pidiendo.
+    const errorKey = Object.keys(data.errors)[0];
+    const reason = data.errors[errorKey];
+    if (errorKey === "access" || errorKey === "token") {
+      markAccountBlocked(reason);
+      throw new AccountBlockedError(reason);
+    }
+    throw new Error(`API-Football error: ${JSON.stringify(data.errors)}`);
   }
 
   return data.response || [];
