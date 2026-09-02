@@ -138,6 +138,73 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
 - `GET /api/quota` — cuánto se gastó hoy, sin costo
 - `GET /health`
 
+## Cache de borde con un Cloudflare Worker (backend se queda en Render)
+
+Este backend manda `Cache-Control` con el tiempo de vida real que le
+queda a cada dato cacheado (ver `setCacheHeaders` en `server.js`), pero
+Render enruta *todos* sus dominios custom a través de la propia red de
+Cloudflare por atrás (confirmable con `nslookup tu-app.onrender.com` —
+resuelve a `*.origin.onrender.com.cdn.cloudflare.net`). Eso descarta la
+forma "normal" de poner Cloudflare delante (un simple DNS proxeado): una
+zona Cloudflare no puede proxear directo sobre un origen que ya está
+detrás de Cloudflare — tira **Error 1000 "DNS points to prohibited
+IP"**, una regla anti-loop de la plataforma, no algo que se arregle
+reconfigurando DNS.
+
+La salida: un **Cloudflare Worker** (gratis hasta 100k requests/día, sin
+tarjeta) que actúa de proxy-cache. No es "otra zona proxeando sobre
+Render" — es código de Cloudflare haciendo un `fetch()` normal hacia
+Render, exactamente igual que lo haría cualquier cliente de internet, así
+que no dispara el Error 1000. El Worker vive en
+`cloudflare-worker/worker.js` de este repo.
+
+### Cómo funciona
+
+1. Request a `api.tu-dominio.com/api/matches?date=...` le pega al Worker.
+2. El Worker busca en `caches.default` (la Cache API de Cloudflare) por
+   esa URL exacta (query string incluido — cada `?date=` es una key
+   distinta, igual que nuestro cache por key de `cache.js`).
+3. **HIT**: devuelve la respuesta cacheada. Render y API-Football nunca
+   se enteran de esta visita.
+4. **MISS**: el Worker le pega a Render de verdad (reenviando
+   `CF-Connecting-IP`, para que el rate limiter de `server.js` siga
+   viendo la IP real del visitante y no la del Worker), y guarda la
+   respuesta en `caches.default` — la Cache API de Cloudflare respeta el
+   `Cache-Control` que ya manda este backend automáticamente (incluido
+   `no-store` en `/api/quota` y `/health`, que por eso nunca se cachean
+   sin que el Worker tenga que saber nada especial de esas dos rutas).
+
+### Deploy
+
+```bash
+cd cloudflare-worker
+npx wrangler login          # tu cuenta Cloudflare, la del dominio
+npx wrangler deploy
+```
+
+`wrangler.toml` ya trae la ruta (`api.tu-dominio.com/*`) — solo hay que
+ajustar `ORIGIN` ahí si tu servicio de Render tiene otro hostname que
+`marcador-backend.onrender.com`.
+
+### DNS y SSL en Cloudflare
+
+Un **Worker Route** no necesita (ni debe) un CNAME real al origen —
+usá un registro placeholder, proxeado, que el Worker intercepta antes de
+que Cloudflare intente resolverlo de verdad:
+
+1. DNS → `api.tu-dominio.com` como registro **A** apuntando a `192.0.2.1`
+   (IP no ruteable, reservada para esto — nunca se usa de verdad, el
+   Worker responde antes), con el proxy naranja/"Proxied" activado.
+2. SSL/TLS → modo **Full** alcanza (Render ya sirve HTTPS propio del
+   otro lado del `fetch()` del Worker).
+3. El registro del frontend en Vercel no cambia — ese no tiene el
+   problema del Error 1000 (Vercel no usa la red de Cloudflare por
+   atrás).
+
+Con esto activo, cualquier corte de reintentos por cuota agotada o cuenta
+bloqueada (ver `quotaGuard.js`) sigue funcionando igual del lado de
+Render — el Worker solo decide si la request llega o no hasta ahí.
+
 ## Si algún día hay que ajustar el límite diario
 
 Si contratás un plan pago con más cuota, cambiá `API_DAILY_LIMIT` en el

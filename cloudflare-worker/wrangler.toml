@@ -1,0 +1,11 @@
+name = "partidos-api-cache"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Intercepta todo /api/* (y /health) en el subdominio antes de que
+# Cloudflare intente resolver el DNS record de esa zona como si fuera un
+# proxy normal — por eso el DNS record puede ser un placeholder (ver
+# README de marcador-backend).
+routes = [
+  { pattern = "api.partidos.com.ar/*", zone_name = "partidos.com.ar" }
+]

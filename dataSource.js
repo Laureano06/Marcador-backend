@@ -20,7 +20,16 @@
 // funciones no existen acá: no hay forma de arreglarlas con código,
 // hace falta un plan pago de API-Football.
 
-const { canMakeRequest, recordRequest, markExhausted, QuotaExceededError } = require("./quotaGuard");
+const {
+  canMakeRequest,
+  recordRequest,
+  markExhausted,
+  QuotaExceededError,
+  isAccountBlocked,
+  markAccountBlocked,
+  accountBlockedInfo,
+  AccountBlockedError,
+} = require("./quotaGuard");
 
 const BASE_URL = "https://v3.football.api-sports.io";
 
@@ -107,6 +116,14 @@ async function apiGet(path, retriesLeft = 2) {
   if (!canMakeRequest()) {
     throw new QuotaExceededError();
   }
+  // Si la cuenta está marcada como bloqueada (suspendida, key inválida,
+  // etc — ver markAccountBlocked), ni siquiera intentamos la llamada real:
+  // reintentar no la va a arreglar, solo gasta contador y sigue golpeando
+  // una cuenta que ya sabemos que va a rechazar todo.
+  const blocked = accountBlockedInfo();
+  if (blocked) {
+    throw new AccountBlockedError(blocked.reason);
+  }
 
   const res = await throttledFetch(`${BASE_URL}${path}`, {
     headers: { "x-apisports-key": process.env.API_FOOTBALL_KEY },
@@ -142,7 +159,15 @@ async function apiGet(path, retriesLeft = 2) {
       markExhausted();
       throw new QuotaExceededError();
     }
-    throw new Error(`API-Football error: ${JSON.stringify(data.errors)}`);
+    // Cualquier otro error trae un problema DE LA CUENTA, no de cuota:
+    // "access" es el que devuelve una cuenta suspendida ("Your account is
+    // suspended, check on https://dashboard.api-football.com."), pero
+    // cortamos igual ante cualquier clave que no sea "requests" — ninguna
+    // se arregla reintentando, y sin este corte seguiríamos gastando el
+    // contador local y golpeando la cuenta en cada cache-miss.
+    const reason = Object.values(data.errors)[0];
+    markAccountBlocked(reason);
+    throw new AccountBlockedError(reason);
   }
 
   return data.response || [];

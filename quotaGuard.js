@@ -15,9 +15,21 @@
 // a un servicio externo).
 
 const db = require("./db");
+const { isExpired: isCacheExpired, setCached, getCached } = require("./cache");
 
 const DAILY_LIMIT = Number(process.env.API_DAILY_LIMIT || 100);
 const SAFETY_MARGIN = 5; // dejamos de pedir un poco antes del límite real
+
+// Cuánto tiempo cortamos SIN reintentar cuando la API contesta un error de
+// cuenta (suspendida, key inválida, etc — cualquier cosa que NO sea "se
+// acabó la cuota del día", que ya tiene su propio corte en canMakeRequest).
+// Reintentar cada 20 min (el TTL de "hoy") contra una cuenta suspendida no
+// la va a arreglar, solo sigue gastando el contador local y golpeando una
+// cuenta que ya está marcada — 1 hora es un back-off razonable sin dejar
+// el sitio roto por más tiempo del necesario si alguien soluciona el
+// problema del lado de API-Football mientras tanto.
+const ACCOUNT_BLOCK_COOLDOWN_MS = 60 * 60 * 1000;
+const BLOCK_CACHE_KEY = "quotaGuard:accountBlocked";
 
 function todayKey() {
   return new Date().toISOString().slice(0, 10);
@@ -88,4 +100,45 @@ class QuotaExceededError extends Error {
   }
 }
 
-module.exports = { canMakeRequest, recordRequest, getUsage, markExhausted, QuotaExceededError };
+// Distinto de QuotaExceededError: esto es un problema DE LA CUENTA (ej.
+// suspendida, key inválida), no de haber gastado el cupo del día. La API
+// lo reporta como data.errors.access (u otra clave que no sea "requests").
+function isAccountBlocked() {
+  return !isCacheExpired(BLOCK_CACHE_KEY);
+}
+
+function markAccountBlocked(reason) {
+  setCached(BLOCK_CACHE_KEY, { reason, blockedAt: Date.now() }, ACCOUNT_BLOCK_COOLDOWN_MS);
+  console.warn(
+    `[quota] la API reportó un problema de cuenta ("${reason}") — cortando reintentos por ${
+      ACCOUNT_BLOCK_COOLDOWN_MS / 60000
+    } min en vez de seguir golpeándola en cada cache-miss.`
+  );
+}
+
+function accountBlockedInfo() {
+  return isAccountBlocked() ? getCached(BLOCK_CACHE_KEY) : null;
+}
+
+class AccountBlockedError extends Error {
+  constructor(reason) {
+    super(
+      reason
+        ? `La cuenta de API-Football tiene un problema: "${reason}". Revisá https://dashboard.api-football.com — esto no se arregla con reintentos.`
+        : "La cuenta de API-Football tiene un problema de acceso. Revisá https://dashboard.api-football.com."
+    );
+    this.name = "AccountBlockedError";
+  }
+}
+
+module.exports = {
+  canMakeRequest,
+  recordRequest,
+  getUsage,
+  markExhausted,
+  QuotaExceededError,
+  isAccountBlocked,
+  markAccountBlocked,
+  accountBlockedInfo,
+  AccountBlockedError,
+};

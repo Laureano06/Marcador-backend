@@ -10,12 +10,18 @@ const {
   fetchTeamProfile,
   fetchMatchDetail,
 } = require("./dataSource");
-const { getCached, getCachedMeta, setCached, isExpired } = require("./cache");
-const { getUsage, QuotaExceededError } = require("./quotaGuard");
+const { getCached, getCachedMeta, isExpired } = require("./cache");
+const { getOrFetch } = require("./withCache");
+const { getUsage, QuotaExceededError, AccountBlockedError } = require("./quotaGuard");
 
 const app = express();
 app.use(cors());
 app.use(compression()); // gzip de las respuestas — el feed de partidos por día puede ser varios KB de JSON con muchas ligas; en 3G/4G esto se nota
+
+// Render ya mete su propio proxy entre el visitante y este proceso —
+// sin esto, req.ip siempre da la IP interna de ese proxy, no la del
+// visitante real, y con Cloudflare delante se suma un hop más.
+app.set("trust proxy", 1);
 
 // Rate limit liviano por IP. No cuida la cuota de API-Football directamente
 // (eso lo hace quotaGuard — pegarle en loop a un endpoint cacheado no gasta
@@ -26,6 +32,14 @@ const apiLimiter = rateLimit({
   limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  // Cloudflare siempre manda la IP real del visitante en este header, sin
+  // importar cuántos proxies haya en el medio (el de Render incluido) —
+  // más confiable que reconstruir la cadena de X-Forwarded-For a mano. Sin
+  // esto, con Cloudflare delante, TODO el tráfico del sitio compartiría el
+  // mismo límite de 60/min (la IP del borde de Cloudflare), en vez de un
+  // límite por visitante real. Sin Cloudflare (dev local, o pegándole al
+  // .onrender.com directo) el header no está y cae a req.ip como antes.
+  keyGenerator: (req) => req.headers["cf-connecting-ip"] || req.ip,
   message: { error: "Demasiadas requests, esperá un momento." },
 });
 app.use("/api/", apiLimiter);
@@ -88,14 +102,31 @@ function setCacheHeaders(res, meta) {
   res.set("Cache-Control", `public, max-age=${maxAge}`);
 }
 
+// Antes, un error de cuota/cuenta cortaba directo con un 503 SIN probar el
+// fallback stale — al revés de lo que promete el resto del sistema (mostrar
+// datos viejos en vez de romper la pantalla). Ahora los tres casos intentan
+// el fallback primero; el error solo se devuelve cuando no hay nada
+// cacheado para mostrar en su lugar.
 function handleError(res, err, fallback) {
   if (err instanceof QuotaExceededError) {
     console.warn("[api] cuota agotada:", err.message);
+    if (fallback) return res.json(fallback);
     return res.status(503).json({ error: err.message, quotaExceeded: true });
+  }
+  if (err instanceof AccountBlockedError) {
+    console.warn("[api] cuenta bloqueada:", err.message);
+    if (fallback) return res.json(fallback);
+    return res.status(503).json({ error: err.message, accountBlocked: true });
   }
   console.error("[api] error:", err.message);
   if (fallback) return res.json(fallback);
-  res.status(502).json({ error: "No se pudo obtener datos de API-Football" });
+  // 500, no 502: Cloudflare reemplaza el body de CUALQUIER respuesta 502
+  // (o 504, 520-527 — su familia de "errores de gateway") por su propia
+  // página genérica de error, incluso cuando ese 502 lo generamos nosotros
+  // y viaja a través de nuestro propio Worker de cache — confirmado
+  // reproduciéndolo: el body que llega al cliente deja de ser el nuestro.
+  // 500 y 503 no están en esa lista, pasan intactos.
+  res.status(500).json({ error: "No se pudo obtener datos de API-Football" });
 }
 
 // GET /api/matches?date=2026-08-16
@@ -107,13 +138,14 @@ app.get("/api/matches", async (req, res) => {
 
   const key = `matches:${date}`;
   try {
-    if (isExpired(key)) {
-      console.log(`[api] pidiendo partidos de ${date} a API-Football...`);
-      const matches = await fetchMatchesForDate(date);
-      setCached(key, matches, matchesTtlFor(date));
-    } else {
-      console.log(`[api] sirviendo partidos de ${date} desde cache`);
-    }
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo partidos de ${date} a API-Football...`);
+        return fetchMatchesForDate(date);
+      },
+      matchesTtlFor(date)
+    );
     const meta = getCachedMeta(key);
     setCacheHeaders(res, meta);
     res.json({ updatedAt: new Date(meta.updatedAt).toISOString(), matches: meta.data });
@@ -140,14 +172,16 @@ app.get("/api/search", async (req, res) => {
 
   const key = `search:${q.toLowerCase()}`;
   try {
-    if (isExpired(key)) {
-      console.log(`[api] buscando "${q}" en API-Football...`);
-      const teams = await searchTeams(q);
-      const leagues = searchLeagues(q); // no gasta requests
-      setCached(key, { teams, leagues }, SEARCH_TTL_MS);
-    } else {
-      console.log(`[api] sirviendo búsqueda "${q}" desde cache`);
-    }
+    await getOrFetch(
+      key,
+      async () => {
+        console.log(`[api] buscando "${q}" en API-Football...`);
+        const teams = await searchTeams(q);
+        const leagues = searchLeagues(q); // no gasta requests
+        return { teams, leagues };
+      },
+      SEARCH_TTL_MS
+    );
     setCacheHeaders(res, getCachedMeta(key));
     res.json(getCached(key));
   } catch (err) {
@@ -161,13 +195,14 @@ app.get("/api/teams/:id", async (req, res) => {
   const { id } = req.params;
   const key = `team:${id}`;
   try {
-    if (isExpired(key)) {
-      console.log(`[api] pidiendo ficha del equipo ${id} a API-Football...`);
-      const profile = await fetchTeamProfile(id);
-      setCached(key, profile, TEAM_PROFILE_TTL_MS);
-    } else {
-      console.log(`[api] sirviendo ficha del equipo ${id} desde cache`);
-    }
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo ficha del equipo ${id} a API-Football...`);
+        return fetchTeamProfile(id);
+      },
+      TEAM_PROFILE_TTL_MS
+    );
     setCacheHeaders(res, getCachedMeta(key));
     res.json(getCached(key));
   } catch (err) {
@@ -182,13 +217,14 @@ app.get("/api/matches/:id", async (req, res) => {
   const { id } = req.params;
   const key = `match-detail:${id}`;
   try {
-    if (isExpired(key)) {
-      console.log(`[api] pidiendo detalle del partido ${id} a API-Football...`);
-      const detail = await fetchMatchDetail(id);
-      setCached(key, detail, matchDetailTtlFor(detail.status));
-    } else {
-      console.log(`[api] sirviendo detalle del partido ${id} desde cache`);
-    }
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo detalle del partido ${id} a API-Football...`);
+        return fetchMatchDetail(id);
+      },
+      (detail) => matchDetailTtlFor(detail.status)
+    );
     setCacheHeaders(res, getCachedMeta(key));
     res.json(getCached(key));
   } catch (err) {
@@ -224,8 +260,10 @@ async function warmCache() {
   }
   try {
     console.log(`[warmup] precargando partidos de hoy (${today})...`);
-    const matches = await fetchMatchesForDate(today);
-    setCached(key, matches, matchesTtlFor(today));
+    // getOrFetch (no fetchMatchesForDate+setCached directo): si la primera
+    // visita del día llega justo mientras el warmup todavía está en el
+    // aire, comparte esta misma llamada en vez de disparar una segunda.
+    const matches = await getOrFetch(key, () => fetchMatchesForDate(today), matchesTtlFor(today));
     console.log(`[warmup] listo — ${matches.length} partidos cacheados`);
   } catch (err) {
     if (err instanceof QuotaExceededError) {
