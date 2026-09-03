@@ -213,6 +213,13 @@ function normalizeMatch(raw) {
     leagueId: raw.league.id,
     leagueCountry: raw.league.country,
     status,
+    // Solo tienen sentido con status "live" — minuto (null en HT, la API
+    // no lo actualiza durante el entretiempo) y la fase corta ("1H",
+    // "HT", "2H", "ET", "BT", "P") para distinguir "45'" de "descanso".
+    // No cuesta ninguna request extra: ya viene en fixture.status de la
+    // misma llamada que trae todo lo demás.
+    elapsed: status === "live" ? raw.fixture.status.elapsed ?? null : null,
+    statusShort: status === "live" ? raw.fixture.status.short : null,
     home: raw.teams.home.name,
     homeId: raw.teams.home.id,
     homeAb: abbreviate(raw.teams.home.name),
@@ -398,6 +405,8 @@ async function fetchMatchDetail(matchId) {
   return {
     id: matchId,
     status,
+    elapsed: status === "live" ? info.fixture.status.elapsed ?? null : null,
+    statusShort: status === "live" ? info.fixture.status.short : null,
     home: {
       id: info.teams.home.id,
       name: info.teams.home.name,
