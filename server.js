@@ -23,7 +23,7 @@ app.use(compression()); // gzip de las respuestas — el feed de partidos por d�
 // visitante real, y con Cloudflare delante se suma un hop más.
 app.set("trust proxy", 1);
 
-// Rate limit liviano por IP. No cuida la cuota de API-Football directamente
+// Rate limit liviano por IP. No cuida la cuota de la API externa directamente
 // (eso lo hace quotaGuard — pegarle en loop a un endpoint cacheado no gasta
 // requests reales), pero evita que un cliente en loop o un bot generen
 // carga innecesaria en el servidor.
@@ -44,8 +44,11 @@ const apiLimiter = rateLimit({
 });
 app.use("/api/", apiLimiter);
 
-// TTLs pensados para el límite de 100 requests/día. Cuanto más caro es un
-// dato de conseguir (o más lento cambia), más tiempo lo reutilizamos.
+// TTLs pensados para cuidar la cuota diaria (7.500 req/día en el plan
+// free de BSD). Cuanto más caro es un dato de conseguir (o más lento
+// cambia), más tiempo lo reutilizamos — la cuota es mucho más generosa
+// que la de API-Football, pero no gratis: seguimos sin pedir de más algo
+// que ya sabemos que no cambió.
 const MATCHES_TTL_MS = 20 * 60 * 1000; // 20 min — HOY: hay partidos en vivo, cambia rápido
 const PAST_MATCHES_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — un día ya jugado no cambia más
 const FUTURE_MATCHES_TTL_MS = 6 * 60 * 60 * 1000; // 6 hs — fixture programado, rara vez se mueve
@@ -63,7 +66,11 @@ function matchDetailTtlFor(status) {
   return status === "final" ? MATCH_DETAIL_FINAL_TTL_MS : MATCH_DETAIL_TTL_MS;
 }
 
-const TIMEZONE = process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
+// Nombre nuevo (ya no es específico de API-Football); se mantiene el
+// nombre viejo como fallback para no obligar a renombrar la variable en
+// Render el mismo día de la migración.
+const TIMEZONE =
+  process.env.APP_TIMEZONE || process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
 
 // "Hoy" en la misma zona horaria que usa dataSource.js para cortar los
 // días — si no, un partido cerca de medianoche podía clasificarse como
@@ -126,7 +133,7 @@ function handleError(res, err, fallback) {
   // y viaja a través de nuestro propio Worker de cache — confirmado
   // reproduciéndolo: el body que llega al cliente deja de ser el nuestro.
   // 500 y 503 no están en esa lista, pasan intactos.
-  res.status(500).json({ error: "No se pudo obtener datos de API-Football" });
+  res.status(500).json({ error: "No se pudo obtener datos de la API externa" });
 }
 
 // GET /api/matches?date=2026-08-16
@@ -141,7 +148,7 @@ app.get("/api/matches", async (req, res) => {
     await getOrFetch(
       key,
       () => {
-        console.log(`[api] pidiendo partidos de ${date} a API-Football...`);
+        console.log(`[api] pidiendo partidos de ${date} a BSD...`);
         return fetchMatchesForDate(date);
       },
       matchesTtlFor(date)
@@ -175,9 +182,8 @@ app.get("/api/search", async (req, res) => {
     await getOrFetch(
       key,
       async () => {
-        console.log(`[api] buscando "${q}" en API-Football...`);
-        const teams = await searchTeams(q);
-        const leagues = searchLeagues(q); // no gasta requests
+        console.log(`[api] buscando "${q}" en BSD...`);
+        const [teams, leagues] = await Promise.all([searchTeams(q), searchLeagues(q)]);
         return { teams, leagues };
       },
       SEARCH_TTL_MS
@@ -198,7 +204,7 @@ app.get("/api/teams/:id", async (req, res) => {
     await getOrFetch(
       key,
       () => {
-        console.log(`[api] pidiendo ficha del equipo ${id} a API-Football...`);
+        console.log(`[api] pidiendo ficha del equipo ${id} a BSD...`);
         return fetchTeamProfile(id);
       },
       TEAM_PROFILE_TTL_MS
@@ -211,7 +217,7 @@ app.get("/api/teams/:id", async (req, res) => {
   }
 });
 
-// GET /api/matches/:id -> detalle de un partido puntual (API-Football
+// GET /api/matches/:id -> detalle de un partido puntual (BSD
 // resuelve todo por el ID del partido, no hace falta pasar la liga).
 app.get("/api/matches/:id", async (req, res) => {
   const { id } = req.params;
@@ -220,7 +226,7 @@ app.get("/api/matches/:id", async (req, res) => {
     await getOrFetch(
       key,
       () => {
-        console.log(`[api] pidiendo detalle del partido ${id} a API-Football...`);
+        console.log(`[api] pidiendo detalle del partido ${id} a BSD...`);
         return fetchMatchDetail(id);
       },
       (detail) => matchDetailTtlFor(detail.status)

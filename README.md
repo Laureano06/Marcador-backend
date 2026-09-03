@@ -1,49 +1,74 @@
-# Marcador — backend (API-Football, cuidando el límite de 100/día)
+# Marcador — backend (BSD, sports.bzzoiro.com)
 
-Usamos API-Football (dashboard.api-football.com) directo, con una
-arquitectura pensada específicamente para el plan free (100 requests/día,
-10/minuto).
+Usamos **BSD (Bzzoiro Sports Data)** — plan free de fútbol con 7.500
+requests/día y 25/seg de ráfaga por IP. Migrado desde API-Football el
+3/9/2026: esa cuenta terminó suspendida, y su plan free bloqueaba
+standings y "últimos partidos" de temporada actual sin arreglo posible.
 
 ```
-dataSource.js  →  habla con API-Football
-quotaGuard.js  →  cuenta requests del día, corta antes de llegar a 100
+dataSource.js  →  habla con BSD (sports.bzzoiro.com)
+quotaGuard.js  →  cuenta requests del día, corta antes de llegar al límite
 cache.js       →  cache en memoria + SQLite (db.js), por clave y TTL
 db.js          →  conexión SQLite compartida (data/store.db, modo WAL)
 server.js      →  la API que consume el frontend (gzip, rate limit, Cache-Control)
 ```
 
-## Lo que el plan free NO permite (no es un bug, es el límite de la cuenta)
+## Por qué se dejó API-Football (contexto, no acción pendiente)
 
-Antes de tocar código acá, dos restricciones reales de API-Football que
-tiraron abajo funciones enteras y no tienen arreglo posible sin pagar un
-plan superior:
+Dos restricciones reales del plan free de API-Football que tiraron abajo
+funciones enteras y no tenían arreglo posible sin pagar un plan superior:
+`/standings` y cualquier `/fixtures?league=X` con rango de fechas o
+`season` solo daban acceso a temporadas 2022–2024 (nunca la actual), y el
+parámetro `last` (para "últimos partidos" de un equipo) estaba
+directamente prohibido. BSD **no tiene ninguna de las dos
+restricciones** — de hecho da standings de temporada actual en su plan
+free (confirmado: `Liga Profesional de Fútbol` de Argentina, temporada
+2026, `is_current: true`). Por ahora la migración mantiene el mismo
+alcance que ya tenía el sitio (sin standings ni "últimos partidos" en la
+ficha de equipo, ver nota al final) — agregarlos es un paso aparte, no
+bloqueado por la API.
 
-- **`/standings` y cualquier `/fixtures?league=X` con rango de fechas o
-  `season`**: el plan free solo da acceso a temporadas **2022 a 2024**,
-  nunca a la actual. Por eso no hay tabla de posiciones ni "partidos de
-  una liga por temporada" en esta versión — se sacaron enteros, no tiene
-  sentido mostrar un dato que la API nunca va a devolver bien.
-- **`/fixtures?team=X` sin un `date` o `id` puntual** también pide
-  `season` (y cae en el mismo bloqueo), y el parámetro `last` está
-  directamente prohibido en el plan free ("Free plans do not have access
-  to the Last parameter"). Por esto **no existe** "últimos partidos" de
-  un equipo en la ficha — literalmente no hay forma de pedirle eso a la
-  API con esta cuenta.
+## Cómo habla con BSD
 
-Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
-(un día puntual, sin season), `/fixtures?id=X` (un partido puntual),
-`/fixtures/statistics`, `/fixtures/lineups`, `/predictions?fixture=X`,
-`/teams`, `/players/squads`.
+- **Auth**: header `Authorization: Token BSD_API_KEY` (no es Bearer, no
+  es query param).
+- **El feed de partidos por día** usa `/api/v2/events/?date_from=X&date_to=X`,
+  paginado si hace falta (BSD cubre 30+ ligas, normalmente entra en una
+  sola página de 200). Cada evento solo trae `league_id` — el nombre y
+  país de cada liga salen de un directorio completo (`/api/v2/leagues/`)
+  cacheado 24hs en memoria (`getLeagueDirectory` en `dataSource.js`), así
+  que enriquecer 50+ ligas distintas en un día no cuesta 50+ requests.
+- **Escudos y fotos** salen directo de la Image API por id
+  (`sports.bzzoiro.com/img/team/{id}/`, `/img/player/{id}/`) — no hace
+  falta pedir una URL de logo, se arma sola, sin request extra.
+- **Búsqueda de ligas** reusa ese mismo directorio de ligas — normalmente
+  no gasta una request nueva, salvo la primera búsqueda del día.
+- **Países**: BSD usa nombres con espacios ("Saudi Arabia", "South
+  Korea") y para copas internacionales/continentales el país YA es
+  directamente el continente ("Africa", "Europe", "South America",
+  "International") — `leagueCategories.js` del frontend está mapeado
+  contra esto específicamente, verificado contra el directorio real de
+  ligas, no adivinado.
+- **Dos límites de 429, distintos**: `rate_limited` es la ráfaga por IP
+  (25/seg) — pasajera, se reintenta después de `Retry-After`.
+  `taster_exhausted` es la cuota DIARIA real agotada — no tiene sentido
+  reintentar, se sincroniza `quotaGuard` y se corta por el resto del día
+  (ver `markExhausted`, mismo mecanismo que ya existía).
+- **401** (token inválido o revocado) marca la cuenta como bloqueada
+  (`markAccountBlocked`) — no se reintenta contra una cuenta que ya
+  sabemos que va a rechazar todo, mismo criterio que antes con "access"/
+  "token" de API-Football.
 
 ## Cómo se cuida la cuota
 
-1. **El feed de partidos por día es 1 sola request** y trae **todas las
-   ligas del mundo** — no se filtra por país acá adentro. El frontend
-   agrupa lo que llega por continente, juveniles y femenino
-   (`leagueCategories.js`), así que "más ligas" no cuesta una request
-   extra, es el mismo dato de siempre mostrado distinto.
-2. **La búsqueda de ligas no gasta nada** — filtra una lista fija propia
-   (nombre + alias), no le pregunta nada a la API externa.
+1. **El feed de partidos por día es 1 sola request** (paginada si hace
+   falta) y trae **todas las ligas cubiertas por BSD** — no se filtra por
+   país acá adentro. El frontend agrupa lo que llega por continente,
+   juveniles y femenino (`leagueCategories.js`), así que "más ligas" no
+   cuesta una request extra, es el mismo dato de siempre mostrado
+   distinto.
+2. **La búsqueda de ligas casi no gasta nada** — reusa el mismo
+   directorio de ligas que ya se cacheó para el feed del día (24hs).
 3. **TTL variable según el estado, no un número fijo para todo**: el feed
    de partidos por fecha usa 20 min si es HOY (hay partidos en vivo), 6hs
    si es una fecha futura (el fixture rara vez se reprograma), 7 días si
@@ -54,16 +79,16 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
    partido FINAL no cambian nunca más, así que una vez pedido no se
    vuelve a pedir en toda la semana. 1 hora para búsquedas, 24hs para
    fichas de equipo.
-4. **`quotaGuard.js` corta antes de las 100** (con margen de seguridad de
-   5), pase lo que pase. Si se llega al límite, la API devuelve un 503
-   con `quotaExceeded: true` en vez de intentar la request igual.
-5. **Límite por minuto, aparte del diario**: todas las requests salen
-   espaciadas al menos 6.5s entre sí (`throttledFetch` en
-   `dataSource.js`), y un 429 se reintenta después de una pausa en vez de
-   fallar directo. **Costo de esto**: la primera vez que alguien ve algo
-   con varias requests (un partido con pronóstico + alineación, por
-   ejemplo) puede tardar 15-20 segundos en cargar en frío. Una vez
-   cacheado, vuelve a ser instantáneo.
+4. **`quotaGuard.js` corta antes de las 7.500** (con margen de seguridad
+   de 50), pase lo que pase. Si se llega al límite, la API devuelve un
+   503 con `quotaExceeded: true` en vez de intentar la request igual.
+5. **Ráfaga por IP, aparte del diario**: BSD permite 25 req/seg (ráfaga
+   110) — mucho más laxo que el límite por minuto de API-Football, así
+   que ya no hace falta espaciar cada request de forma artificial. Las
+   llamadas de un mismo endpoint (ej. estadísticas + alineación +
+   pronóstico de un partido) salen en paralelo (`Promise.all`), y un 429
+   de código `rate_limited` (la ráfaga, no la cuota diaria) se reintenta
+   después del `Retry-After` que manda la API.
 6. **Cache y contador de cuota persistidos en SQLite** (`data/store.db`,
    modo WAL, ver `db.js`). Antes eran dos archivos JSON reescritos
    enteros en cada escritura (`data/cache.json`, `data/quota.json`) — se
@@ -88,15 +113,14 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
    cache persistido (punto 6), en el caso normal esto no gasta nada.
 9. **El contador local se sincroniza si la API dice que la cuota REAL ya
    se agotó** (`markExhausted()` en `quotaGuard.js`, disparado desde
-   `apiGet` en `dataSource.js` cuando la respuesta trae
-   `errors.requests`). El contador de este proceso solo sabe lo que ÉL
+   `apiGet` en `dataSource.js` cuando un 429 trae `"code":
+   "taster_exhausted"`). El contador de este proceso solo sabe lo que ÉL
    pidió — si la cuenta se quedó sin cuota por otra vía (otro proceso con
    la misma key, o un redeploy que reinició el contador a 0 mientras la
-   cuenta seguía gastada del lado de API-Football), sin esto seguiríamos
-   mandando requests reales que fallan igual, una por una, hasta que el
-   margen de seguridad las corte solo. Con esto, en cuanto la API
-   contesta ese error una vez, el proceso entero corta para el resto del
-   día.
+   cuenta seguía gastada del lado de BSD), sin esto seguiríamos mandando
+   requests reales que fallan igual, una por una, hasta que el margen de
+   seguridad las corte solo. Con esto, en cuanto la API contesta ese
+   error una vez, el proceso entero corta para el resto del día.
 
 10. **Respuestas comprimidas (gzip)** — el feed de partidos de un día
     con muchas ligas puede pesar varios KB de JSON; con `compression`
@@ -110,33 +134,51 @@ Lo que SÍ funciona y es la base de todo lo demás: `/fixtures?date=X`
     cualquier CDN en el medio) puede reusar la respuesta sin volver a
     pegarle al backend, bajando también la carga ahí.
 
-   **Nota real de esta build**: hoy el límite diario real se agotó en
-   medio del desarrollo — no por tráfico de usuarios, sino por las
-   pruebas directas contra la API (afuera del cache) más varios
-   redeploys seguidos, cada uno reiniciando este contador local a 0
-   mientras la cuenta real seguía gastada. Es exactamente el escenario
-   que el punto 9 ahora detecta mejor. En uso normal (sin desarrollo
-   activo en el mismo día) esto no debería repetirse.
+**Nota histórica**: la cuenta de API-Football (proveedor anterior) llegó
+a suspenderse por acumular pruebas de desarrollo + varios redeploys
+seguidos, cada uno reiniciando el contador local a 0 mientras la cuenta
+real seguía gastada — es el escenario que el punto 9 arriba ahora
+detecta y corta de una. Con 7.500 req/día de margen en BSD (75x más que
+las 100 de API-Football) es mucho más difícil que un desarrollo normal
+vuelva a chocar con esto, pero el mecanismo de sincronización queda
+igual de necesario.
 
 ## Cómo correrlo
 
-1. `cp .env.example .env` y pegá tu `API_FOOTBALL_KEY`.
+1. `cp .env.example .env` y pegá tu `BSD_API_KEY` — sacala registrándote
+   gratis en [sports.bzzoiro.com/register/](https://sports.bzzoiro.com/register/)
+   (Cuenta → API key). El fútbol es gratis en su plan free, no pide
+   tarjeta.
 2. `npm install && npm start`
-3. Probar: `curl "http://localhost:3001/api/matches?date=2026-08-20"`
+3. Probar: `curl "http://localhost:3001/api/matches?date=2026-09-05"`
 4. Ver cuánta cuota llevás gastada hoy: `curl "http://localhost:3001/api/quota"`
 
 ## Endpoints
 
-- `GET /api/matches?date=YYYY-MM-DD` — 1 request. TTL variable (ver
-  arriba). Devuelve TODAS las ligas del mundo con partidos ese día.
-- `GET /api/search?q=boca` — 1 request de equipos + búsqueda local de
-  ligas (cacheado 1h)
-- `GET /api/teams/:id` — 2 requests (info + plantel — cacheado 24hs). No
-  incluye "últimos partidos" (ver restricciones arriba).
-- `GET /api/matches/:id` — hasta 4 requests (info + estadísticas si ya
-  arrancó + alineación + pronóstico si todavía no arrancó). Cacheado 2 min.
+- `GET /api/matches?date=YYYY-MM-DD` — 1 request (paginada si hace
+  falta). TTL variable (ver arriba). Devuelve todas las ligas cubiertas
+  por BSD con partidos ese día.
+- `GET /api/search?q=boca` — 1 request de equipos + búsqueda contra el
+  directorio de ligas ya cacheado (1h)
+- `GET /api/teams/:id` — 2 requests en paralelo (info + plantel) + 1 más
+  si el equipo tiene estadio asociado (`venue_id`) — cacheado 24hs. No
+  incluye "últimos partidos" (mismo alcance que ya tenía el sitio antes
+  de esta migración, ver nota más abajo).
+- `GET /api/matches/:id` — hasta 3 requests en paralelo (estadísticas si
+  ya arrancó + alineación + pronóstico si todavía no arrancó, más la
+  info base). Cacheado 2 min (7 días si el partido ya es FINAL).
 - `GET /api/quota` — cuánto se gastó hoy, sin costo
 - `GET /health`
+
+## Si en algún momento se quiere sumar standings o "últimos partidos"
+
+A diferencia de API-Football, BSD **sí** da standings de temporada
+actual (`GET /api/v2/leagues/{id}/standings/?season_id=X`, confirmado con
+Argentina) y "últimos partidos" de un equipo
+(`GET /api/v2/teams/{id}/fixtures/?status=finished&limit=5`) en su plan
+free. No se agregaron en esta migración porque el pedido era migrar el
+alcance existente, no ampliarlo — pero técnicamente ya no hay ningún
+bloqueo de la API para hacerlo.
 
 ## Cache de borde con un Cloudflare Worker (backend se queda en Render)
 
@@ -164,7 +206,7 @@ que no dispara el Error 1000. El Worker vive en
 2. El Worker busca en `caches.default` (la Cache API de Cloudflare) por
    esa URL exacta (query string incluido — cada `?date=` es una key
    distinta, igual que nuestro cache por key de `cache.js`).
-3. **HIT**: devuelve la respuesta cacheada. Render y API-Football nunca
+3. **HIT**: devuelve la respuesta cacheada. Render y BSD nunca
    se enteran de esta visita.
 4. **MISS**: el Worker le pega a Render de verdad (reenviando
    `CF-Connecting-IP`, para que el rate limiter de `server.js` siga
@@ -207,7 +249,6 @@ Render — el Worker solo decide si la request llega o no hasta ahí.
 
 ## Si algún día hay que ajustar el límite diario
 
-Si contratás un plan pago con más cuota, cambiá `API_DAILY_LIMIT` en el
-`.env` (en Render: Environment → esa variable). Si el plan pago también
-da acceso a la temporada actual, ahí sí valdría la pena reintroducir
-standings y "últimos partidos" — hoy no es posible con la cuenta free.
+Si contratás "Football Unlimited" (BSD, sin límite diario) u otro plan
+con más cuota, cambiá `API_DAILY_LIMIT` en el `.env` (en Render:
+Environment → esa variable).

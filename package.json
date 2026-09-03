@@ -1,7 +1,7 @@
 {
   "name": "marcador-backend",
   "version": "2.0.0",
-  "description": "API que consulta API-Football (api-sports.io) y sirve resultados al frontend, con cache por fecha",
+  "description": "API que consulta BSD (sports.bzzoiro.com) y sirve resultados al frontend, con cache por fecha",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

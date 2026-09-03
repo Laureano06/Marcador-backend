@@ -1,194 +1,170 @@
 // Todo lo que sepa sobre "cómo habla la API externa" vive acá adentro.
-// Usamos API-Football (dashboard.api-football.com) directo — header
-// "x-apisports-key" (NO es vía RapidAPI).
+// Usamos BSD (Bzzoiro Sports Data, sports.bzzoiro.com) — header
+// "Authorization: Token TU_KEY". Migrado desde API-Football el 3/9/2026:
+// esa cuenta terminó suspendida y su plan free bloqueaba standings y
+// "últimos partidos" de temporada actual sin arreglo posible. BSD da
+// 7.500 requests/día (vs 100) y SÍ incluye standings de temporada actual
+// en el plan free de fútbol.
 //
-// Diseño pensado para el plan free (100 requests/día):
-// - El feed de partidos por día usa /fixtures?date=X, que trae TODAS las
-//   ligas del mundo en UNA sola llamada — ya no filtramos por país acá
-//   adentro, el frontend agrupa por continente/juvenil/femenino con lo
-//   que llega.
-// - La búsqueda de ligas es local (no gasta requests): filtramos nuestra
-//   propia lista fija.
+// - El feed de partidos por día usa /events/?date_from=X&date_to=X, que
+//   trae TODAS las ligas cubiertas en una sola llamada (paginado si hace
+//   falta). Cada evento solo trae league_id (no nombre/país) — por eso
+//   mantenemos un directorio de ligas (getLeagueDirectory) cacheado 24hs
+//   en memoria, para no resolver cada liga por separado.
+// - La búsqueda de ligas usa ese mismo directorio (ya cacheado, no gasta
+//   una request nueva salvo la primera vez del día).
+// - Los escudos y fotos salen directo de la Image API por id
+//   (sports.bzzoiro.com/img/...), sin request extra: no hace falta pedir
+//   una URL de logo, se arma sola.
 // - Cada llamada pasa por el "quota guard" (quotaGuard.js), que corta
-//   antes de llegar al límite diario.
-//
-// IMPORTANTE — qué NO se puede hacer en este plan: tabla de posiciones
-// (/standings) y partidos de una liga por temporada (/fixtures?league=X
-// &season=Y) están bloqueados para la temporada actual en el plan free
-// ("Free plans do not have access to this season, try from 2022 to
-// 2024" — error real de la API, no un bug nuestro). Por eso esas
-// funciones no existen acá: no hay forma de arreglarlas con código,
-// hace falta un plan pago de API-Football.
+//   antes de llegar al límite diario y detecta cuenta bloqueada.
 
 const {
   canMakeRequest,
   recordRequest,
   markExhausted,
   QuotaExceededError,
-  isAccountBlocked,
-  markAccountBlocked,
   accountBlockedInfo,
+  markAccountBlocked,
   AccountBlockedError,
 } = require("./quotaGuard");
 
-const BASE_URL = "https://v3.football.api-sports.io";
-
-// API-Football corta los "días" en UTC por default cuando filtrás por
-// fecha (?date=X, ?from=X&to=Y) — un partido a las 21hs en Argentina
-// (UTC-3) cae después de medianoche UTC, así que sin esto aparecía
-// agrupado en el día siguiente. Este parámetro le dice a la API con qué
-// zona horaria cortar los días.
-const TIMEZONE = process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
-
-// Ligas conocidas para la búsqueda local (searchLeagues, más abajo) — no
-// gasta requests, solo filtra este listado fijo.
-const LEAGUES = [
-  // --- Sudamérica ---
-  {
-    slug: "arg-liga-profesional",
-    name: "Liga Profesional Argentina",
-    country: "Argentina",
-    region: "Sudamérica",
-    aliases: ["Liga Profesional Argentina", "Liga Profesional", "Primera División"],
-  },
-  { slug: "arg-copa", name: "Copa Argentina", country: "Argentina", region: "Sudamérica", aliases: ["Copa Argentina"] },
-  { slug: "bra-serieA", name: "Brasileirão", country: "Brazil", region: "Sudamérica", aliases: ["Serie A", "Brasileirão", "Brasileiro"] },
-  {
-    slug: "uru-primera",
-    name: "Primera División",
-    country: "Uruguay",
-    region: "Sudamérica",
-    aliases: ["Primera División", "Liga AUF Uruguaya", "Campeonato Uruguayo"],
-  },
-  {
-    slug: "chi-primera",
-    // Ojo: esta liga se rebrandeó de "Primera División" a "Liga de
-    // Primera" hace unas temporadas — por eso el nombre de display y los
-    // alias de búsqueda son distintos. Si en el futuro cambia de nuevo,
-    // acá es donde hay que sumar el nombre nuevo.
-    name: "Liga de Primera",
-    country: "Chile",
-    region: "Sudamérica",
-    aliases: ["Liga de Primera", "Primera División", "Campeonato Nacional"],
-  },
-  // --- Europa ---
-  { slug: "eng-premier", name: "Premier League", country: "England", region: "Europa", aliases: ["Premier League"] },
-  { slug: "esp-laliga", name: "La Liga", country: "Spain", region: "Europa", aliases: ["La Liga", "Primera División", "LaLiga"] },
-  { slug: "ita-seriea", name: "Serie A", country: "Italy", region: "Europa", aliases: ["Serie A"] },
-  { slug: "ger-bundesliga", name: "Bundesliga", country: "Germany", region: "Europa", aliases: ["Bundesliga"] },
-  { slug: "fra-ligue1", name: "Ligue 1", country: "France", region: "Europa", aliases: ["Ligue 1"] },
-  { slug: "por-primeira", name: "Primeira Liga", country: "Portugal", region: "Europa", aliases: ["Primeira Liga", "Liga Portugal"] },
-  { slug: "ned-eredivisie", name: "Eredivisie", country: "Netherlands", region: "Europa", aliases: ["Eredivisie"] },
-  // --- Internacional (competencias continentales/globales, no de un solo país) ---
-  { slug: "world-cup", name: "Mundial", country: "World", region: "Internacional", aliases: ["World Cup"] },
-  { slug: "uefa-champions", name: "UEFA Champions League", country: "World", region: "Internacional", aliases: ["UEFA Champions League", "Champions League"] },
-  { slug: "conmebol-libertadores", name: "Copa Libertadores", country: "World", region: "Internacional", aliases: ["Copa Libertadores", "CONMEBOL Libertadores"] },
-  { slug: "conmebol-sudamericana", name: "Copa Sudamericana", country: "World", region: "Internacional", aliases: ["Copa Sudamericana", "CONMEBOL Sudamericana"] },
-];
-
-// El plan free de API-Football tiene, ADEMÁS del límite de 100/día, un
-// límite de requests POR MINUTO (típicamente 10). El quotaGuard cuida el
-// límite diario, pero no alcanza para evitar ráfagas cortas — por eso acá
-// espaciamos cada request saliente con un mínimo de tiempo entre una y la
-// siguiente, en una cola. Con 6.5s de espaciado como mínimo, el máximo
-// posible es ~9 requests/minuto, por debajo del límite típico de 10.
-const MIN_REQUEST_INTERVAL_MS = 6500;
-let requestQueue = Promise.resolve();
-let lastRequestAt = 0;
+const BASE_URL = "https://sports.bzzoiro.com/api/v2";
+const IMG_BASE = "https://sports.bzzoiro.com/img";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function throttledFetch(url, options) {
-  const run = requestQueue.then(async () => {
-    const wait = Math.max(0, lastRequestAt + MIN_REQUEST_INTERVAL_MS - Date.now());
-    if (wait > 0) await sleep(wait);
-    lastRequestAt = Date.now();
-    return fetch(url, options);
-  });
-  // Encadenamos aunque falle, para que un error no trabe la cola entera.
-  requestQueue = run.catch(() => {});
-  return run;
+// Los endpoints de lista de BSD a veces devuelven un array plano y a veces
+// el sobre paginado {count, next, previous, results} (confirmado
+// inconsistente entre lo que documenta la guía y el schema OpenAPI) —
+// manejamos los dos casos acá en un solo lugar en vez de repetir el
+// chequeo en cada función.
+function listItems(json) {
+  if (Array.isArray(json)) return json;
+  return json?.results || [];
 }
 
-async function apiGet(path, retriesLeft = 2) {
+async function apiGet(path, retriesLeft = 3) {
   if (!canMakeRequest()) {
     throw new QuotaExceededError();
   }
-  // Si la cuenta está marcada como bloqueada (suspendida, key inválida,
-  // etc — ver markAccountBlocked), ni siquiera intentamos la llamada real:
-  // reintentar no la va a arreglar, solo gasta contador y sigue golpeando
-  // una cuenta que ya sabemos que va a rechazar todo.
+  // Cuenta marcada como bloqueada (token inválido/revocado, etc) — no
+  // reintentamos: eso no se arregla solo, y seguir pegándole solo gasta
+  // contador contra una cuenta que ya sabemos que va a rechazar todo.
   const blocked = accountBlockedInfo();
   if (blocked) {
     throw new AccountBlockedError(blocked.reason);
   }
 
-  const res = await throttledFetch(`${BASE_URL}${path}`, {
-    headers: { "x-apisports-key": process.env.API_FOOTBALL_KEY },
+  // Fallback a API_FOOTBALL_KEY: nombre viejo de la variable, por si
+  // alguien pegó la key nueva de BSD ahí en vez de crear BSD_API_KEY.
+  const apiKey = process.env.BSD_API_KEY || process.env.API_FOOTBALL_KEY;
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { Authorization: `Token ${apiKey}` },
   });
   recordRequest();
 
-  // 429 = nos pasamos del límite por minuto, a pesar del espaciado (puede
-  // pasar si hay ráfagas de varios usuarios a la vez). Esperamos un poco
-  // y reintentamos, en vez de fallar directo — lo más probable es que la
-  // siguiente vuelta ya funcione.
-  if (res.status === 429 && retriesLeft > 0) {
-    console.warn(`[dataSource] 429 (límite por minuto) en ${path}, reintentando...`);
-    await sleep(8000);
-    return apiGet(path, retriesLeft - 1);
-  }
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`API-Football respondió ${res.status}: ${body}`);
-  }
-
-  const data = await res.json();
-
-  if (data.errors && Object.keys(data.errors).length > 0) {
-    // "reached the request limit for the day" es la cuota REAL de la
-    // cuenta agotada — puede pasar aunque nuestro contador local diga
-    // que hay margen (otro proceso con la misma key, o un redeploy que
-    // reinició el contador a 0 mientras la cuenta seguía gastada del
-    // lado de API-Football). Cuando pasa, sincronizamos el guard para
-    // que este proceso corte de una por hoy, en vez de seguir mandando
-    // requests reales que van a fallar igual.
-    if (data.errors.requests) {
+  // BSD separa DOS límites de 429 por "code", y quieren reacciones
+  // opuestas (ver docs/conventions): "rate_limited" es la ráfaga por IP
+  // (25/seg) — pasajera, un reintento corto alcanza. "taster_exhausted"
+  // es la cuota DIARIA real de la cuenta agotada — reintentar no sirve de
+  // nada hasta medianoche UTC, hay que sincronizar el guard y cortar.
+  if (res.status === 429) {
+    let body = {};
+    try {
+      body = await res.json();
+    } catch {
+      // sin body parseable, tratamos como ráfaga (el caso más común)
+    }
+    if (body.code === "taster_exhausted") {
       markExhausted();
       throw new QuotaExceededError();
     }
-    // OJO: solo "access" y "token" son problemas DE LA CUENTA de verdad
-    // (suspendida, key inválida/faltante) — esos afectan CUALQUIER llamada
-    // por igual, así que ahí sí tiene sentido cortar todo por un rato.
-    // Cualquier otra clave (ej. "date", "season", "league") es una
-    // restricción del plan free sobre ESE pedido puntual — como el límite
-    // de temporada en standings, que ya sabíamos que existía. Bloquear
-    // TODO por un error de una fecha puntual fue un bug: dejaba search,
-    // ficha de equipo y detalle de partido rotos con un mensaje que ni
-    // siquiera correspondía a lo que esos endpoints estaban pidiendo.
-    const errorKey = Object.keys(data.errors)[0];
-    const reason = data.errors[errorKey];
-    if (errorKey === "access" || errorKey === "token") {
-      markAccountBlocked(reason);
-      throw new AccountBlockedError(reason);
+    if (retriesLeft > 0) {
+      const retryAfter = Number(res.headers.get("retry-after")) || 1;
+      await sleep((retryAfter + 0.2) * 1000);
+      return apiGet(path, retriesLeft - 1);
     }
-    throw new Error(`API-Football error: ${JSON.stringify(data.errors)}`);
+    throw new Error("BSD: límite de ráfaga por IP superado, reintentos agotados");
   }
 
-  return data.response || [];
+  // Token faltante o inválido — afecta CUALQUIER llamada por igual, tiene
+  // sentido cortar todo por un rato en vez de romper endpoint por
+  // endpoint (mismo criterio que "access"/"token" tenía con API-Football).
+  if (res.status === 401) {
+    markAccountBlocked("Token inválido o faltante (401) — revisá BSD_API_KEY en el .env");
+    throw new AccountBlockedError("Token inválido o faltante");
+  }
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body.detail || JSON.stringify(body);
+    } catch {
+      detail = await res.text().catch(() => "");
+    }
+    throw new Error(`BSD respondió ${res.status}${detail ? `: ${detail}` : ""}`);
+  }
+
+  return res.json();
 }
 
-function statusFromApi(shortCode) {
-  const LIVE = ["1H", "HT", "2H", "ET", "BT", "P", "LIVE"];
-  const FINISHED = ["FT", "AET", "PEN"];
-  const OFF = ["PST", "CANC", "ABD", "SUSP", "AWD", "WO"];
+// Directorio completo de ligas (id -> {name, country, ...}), cacheado en
+// memoria 24hs. Los eventos solo traen league_id — sin esto habría que
+// resolver cada liga por separado, y un día con 50+ ligas activas
+// costaría 50+ requests extra en vez de una sola carga diaria.
+let leagueDirectory = null;
+let leagueDirectoryAt = 0;
+const LEAGUE_DIRECTORY_TTL_MS = 24 * 60 * 60 * 1000;
 
-  if (LIVE.includes(shortCode)) return "live";
-  if (FINISHED.includes(shortCode)) return "final";
-  if (OFF.includes(shortCode)) return "postponed";
-  return "scheduled";
+async function getLeagueDirectory() {
+  if (leagueDirectory && Date.now() - leagueDirectoryAt < LEAGUE_DIRECTORY_TTL_MS) {
+    return leagueDirectory;
+  }
+
+  const all = [];
+  let offset = 0;
+  // Tope de 10 páginas (2000 ligas) como red de seguridad — "30+ leagues"
+  // según la doc, en la práctica esto entra en una sola página.
+  for (let page = 0; page < 10; page++) {
+    const json = await apiGet(`/leagues/?limit=200&offset=${offset}`);
+    const items = listItems(json);
+    all.push(...items);
+    if (items.length < 200) break;
+    offset += 200;
+  }
+
+  leagueDirectory = new Map(all.map((l) => [l.id, l]));
+  leagueDirectoryAt = Date.now();
+  return leagueDirectory;
+}
+
+function statusFromBsd(status) {
+  const LIVE = new Set(["inprogress", "1st_half", "halftime", "2nd_half", "extra_time", "penalties", "live"]);
+  const FINISHED = new Set(["finished", "aet", "pen"]);
+  const OFF = new Set(["postponed", "cancelled", "unresolved", "abandoned"]);
+
+  if (LIVE.has(status)) return "live";
+  if (FINISHED.has(status)) return "final";
+  if (OFF.has(status)) return "postponed";
+  return "scheduled"; // notstarted
+}
+
+// Traduce el período de BSD al mismo código corto que ya entendía el
+// frontend (utils.js: liveMinuteLabel, pensado en su momento para los
+// códigos de API-Football) — así esa lógica no tuvo que tocarse.
+const PERIOD_TO_SHORT = {
+  "1st_half": "1H",
+  halftime: "HT",
+  "2nd_half": "2H",
+  extra_time: "ET",
+  penalties: "P",
+};
+function periodToShortCode(period) {
+  return PERIOD_TO_SHORT[period] || null;
 }
 
 function abbreviate(name) {
@@ -203,226 +179,253 @@ function abbreviate(name) {
     .toUpperCase();
 }
 
-function normalizeMatch(raw) {
-  const status = statusFromApi(raw.fixture.status.short);
+function crestUrl(teamId) {
+  return teamId ? `${IMG_BASE}/team/${teamId}/?bg=transparent` : null;
+}
+
+function normalizeMatch(raw, leagues) {
+  const status = statusFromBsd(raw.status);
   const hasScore = status !== "scheduled";
+  const isLive = status === "live";
+  const league = leagues.get(raw.league_id);
 
   return {
-    id: raw.fixture.id,
-    league: raw.league.name,
-    leagueId: raw.league.id,
-    leagueCountry: raw.league.country,
+    id: raw.id,
+    league: league?.name || "Otras competencias",
+    leagueId: raw.league_id,
+    leagueCountry: league?.country || "World",
     status,
-    // Solo tienen sentido con status "live" — minuto (null en HT, la API
-    // no lo actualiza durante el entretiempo) y la fase corta ("1H",
-    // "HT", "2H", "ET", "BT", "P") para distinguir "45'" de "descanso".
-    // No cuesta ninguna request extra: ya viene en fixture.status de la
-    // misma llamada que trae todo lo demás.
-    elapsed: status === "live" ? raw.fixture.status.elapsed ?? null : null,
-    statusShort: status === "live" ? raw.fixture.status.short : null,
-    home: raw.teams.home.name,
-    homeId: raw.teams.home.id,
-    homeAb: abbreviate(raw.teams.home.name),
-    homeCrest: raw.teams.home.logo || null,
-    away: raw.teams.away.name,
-    awayId: raw.teams.away.id,
-    awayAb: abbreviate(raw.teams.away.name),
-    awayCrest: raw.teams.away.logo || null,
-    scoreHome: hasScore ? raw.goals.home ?? null : null,
-    scoreAway: hasScore ? raw.goals.away ?? null : null,
-    start: raw.fixture.date,
+    elapsed: isLive ? raw.current_minute ?? null : null,
+    statusShort: isLive ? periodToShortCode(raw.period || raw.status) : null,
+    home: raw.home_team,
+    homeId: raw.home_team_id,
+    homeAb: abbreviate(raw.home_team),
+    homeCrest: crestUrl(raw.home_team_id),
+    away: raw.away_team,
+    awayId: raw.away_team_id,
+    awayAb: abbreviate(raw.away_team),
+    awayCrest: crestUrl(raw.away_team_id),
+    scoreHome: hasScore ? raw.home_score ?? null : null,
+    scoreAway: hasScore ? raw.away_score ?? null : null,
+    start: raw.event_date,
     prob: null,
   };
 }
 
-// TODOS los partidos de TODAS las ligas para un día puntual, en UNA sola
-// llamada a la API. Es la joya de la corona de esta versión: el feed de
-// "todas las ligas disponibles" cuesta 1 request, no 14.
+// TODOS los partidos de TODAS las ligas cubiertas para un día puntual.
+// Paginado por las dudas (30+ ligas normalmente entra en una página de
+// 200, pero una fecha con muchos partidos podría no entrar).
 async function fetchMatchesForDate(dateStr) {
-  const response = await apiGet(
-    `/fixtures?date=${dateStr}&timezone=${encodeURIComponent(TIMEZONE)}`
-  );
+  const leagues = await getLeagueDirectory();
 
-  return response.map(normalizeMatch).sort((a, b) => a.start.localeCompare(b.start));
+  const all = [];
+  let offset = 0;
+  for (let page = 0; page < 10; page++) {
+    const json = await apiGet(
+      `/events/?date_from=${dateStr}&date_to=${dateStr}&limit=200&offset=${offset}`
+    );
+    const items = listItems(json);
+    all.push(...items);
+    if (items.length < 200) break;
+    offset += 200;
+  }
+
+  return all.map((raw) => normalizeMatch(raw, leagues)).sort((a, b) => a.start.localeCompare(b.start));
 }
 
 // Busca equipos por nombre. 1 request por texto de búsqueda (se cachea
 // por texto desde server.js).
 async function searchTeams(query) {
-  const response = await apiGet(`/teams?search=${encodeURIComponent(query)}`);
-  return response.map((item) => ({
-    id: item.team.id,
-    name: item.team.name,
-    country: item.team.country,
-    crest: item.team.logo || null,
+  const json = await apiGet(`/teams/?name=${encodeURIComponent(query)}&limit=10`);
+  return listItems(json).map((t) => ({
+    id: t.id,
+    name: t.name,
+    country: t.country || "",
+    crest: crestUrl(t.id),
   }));
 }
 
-// Búsqueda de ligas: NO gasta requests — filtra nuestra propia lista fija,
-// por nombre de display o por cualquiera de sus alias.
-function searchLeagues(query) {
+// Búsqueda de ligas: usa el mismo directorio cacheado que el feed del
+// día (getLeagueDirectory) — normalmente no gasta una request nueva,
+// salvo la primera búsqueda del día si el feed todavía no lo cargó.
+async function searchLeagues(query) {
+  const leagues = await getLeagueDirectory();
   const q = query.toLowerCase();
-  return LEAGUES.filter(
-    (l) =>
-      l.name.toLowerCase().includes(q) ||
-      (l.aliases || []).some((a) => a.toLowerCase().includes(q))
-  ).map((l) => ({
-    id: l.slug,
-    name: l.name,
-    country: l.country,
-    logo: null,
-  }));
+  return [...leagues.values()]
+    .filter((l) => l.name.toLowerCase().includes(q))
+    .slice(0, 10)
+    .map((l) => ({ id: l.id, name: l.name, country: l.country, logo: `${IMG_BASE}/league/${l.id}/` }));
 }
 
-// Ficha de equipo: info + plantel. 2 requests, cacheado 24hs desde
-// server.js.
-//
-// IMPORTANTE: "últimos partidos" (recentForm) YA NO EXISTE ACÁ. Usaba
-// /fixtures?team=X&last=5, y el plan free bloqueó el parámetro "last"
-// ("Free plans do not have access to the Last parameter") — y no hay
-// vuelta: CUALQUIER /fixtures?team=X sin un "date" o "id" puntual pide
-// season, y season de la temporada actual también está bloqueada en
-// este plan (mismo problema que standings). No es un bug, es el límite
-// real de la cuenta gratuita.
+const POSITION_EXPAND = { G: "Goalkeepers", D: "Defenders", M: "Midfielders", F: "Forwards" };
+
+function ageFromDob(dob) {
+  const birth = new Date(dob);
+  if (Number.isNaN(birth.getTime())) return null;
+  const now = new Date();
+  let age = now.getFullYear() - birth.getFullYear();
+  const monthDiff = now.getMonth() - birth.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < birth.getDate())) age--;
+  return age;
+}
+
+// Ficha de equipo: info + plantel (2 requests en paralelo) + estadio si
+// tiene venue_id (1 request más). BSD no da founded ni "últimos
+// partidos" en esta ficha — se mantiene el mismo contrato que ya tenía
+// esta función con API-Football (sin recentForm), la migración no agrega
+// alcance nuevo.
 async function fetchTeamProfile(teamId) {
-  const [infoRes, squadRes] = await Promise.all([
-    apiGet(`/teams?id=${teamId}`),
-    apiGet(`/players/squads?team=${teamId}`),
+  const [info, squadRes] = await Promise.all([
+    apiGet(`/teams/${teamId}/`),
+    apiGet(`/teams/${teamId}/squad/`),
   ]);
 
-  const info = infoRes[0];
-  if (!info) throw new Error("Equipo no encontrado");
+  let venue = null;
+  if (info.venue_id) {
+    try {
+      const v = await apiGet(`/venues/${info.venue_id}/`);
+      venue = {
+        name: v.name || null,
+        city: v.city || null,
+        capacity: v.capacity || null,
+        image: null,
+      };
+    } catch (err) {
+      console.error(`[dataSource] no se pudo obtener el estadio ${info.venue_id}:`, err.message);
+    }
+  }
 
-  const squad = (squadRes[0]?.players || []).map((p) => ({
+  const squad = (squadRes.players || []).map((p) => ({
     id: p.id,
     name: p.name,
-    number: p.number,
-    position: p.position,
-    age: p.age,
-    photo: p.photo || null,
+    number: p.jersey_number,
+    position: POSITION_EXPAND[p.position] || p.position || "Otros",
+    age: p.date_of_birth ? ageFromDob(p.date_of_birth) : null,
+    photo: `${IMG_BASE}/player/${p.id}/?sor=true&bg=transparent`,
   }));
 
   return {
-    id: info.team.id,
-    name: info.team.name,
-    country: info.team.country,
-    founded: info.team.founded || null,
-    crest: info.team.logo || null,
-    venue: info.venue
-      ? {
-          name: info.venue.name || null,
-          city: info.venue.city || null,
-          capacity: info.venue.capacity || null,
-          image: info.venue.image || null,
-        }
-      : null,
+    id: info.id,
+    name: info.name,
+    country: info.country || null,
+    founded: null,
+    crest: crestUrl(info.id),
+    venue,
     squad,
   };
 }
 
-// Pronóstico (% local/empate/visitante) para un partido puntual. Solo
-// tiene sentido antes de que arranque — confirmado que el plan free SÍ
-// da acceso a este endpoint (a diferencia de standings).
-async function fetchPredictions(matchId) {
-  try {
-    const response = await apiGet(`/predictions?fixture=${matchId}`);
-    const pred = response[0]?.predictions;
-    if (!pred?.percent) return null;
-
-    const toNumber = (s) => (s ? parseFloat(s.replace("%", "")) : null);
-    const home = toNumber(pred.percent.home);
-    const draw = toNumber(pred.percent.draw);
-    const away = toNumber(pred.percent.away);
-    if (home == null || draw == null || away == null) return null;
-
-    return { home, draw, away, advice: pred.advice || null };
-  } catch (err) {
-    console.error(`[dataSource] no se pudo obtener pronóstico del partido ${matchId}:`, err.message);
-    return null;
-  }
-}
-
-// Detalle de UN partido: info base (1 request) + estadísticas (1, solo si
-// ya arrancó) + alineación (1, real o probable según el momento) +
-// pronóstico (1, solo si todavía no arrancó). Hasta 4 requests, cacheado
-// 2 min desde server.js.
+// Detalle de UN partido: info base + estadísticas (si ya arrancó) +
+// alineación + pronóstico (si todavía no arrancó), estadísticas/alineación
+// y pronóstico en paralelo.
+//
+// El mapeo de /stats/ y /prediction/ está verificado contra respuestas
+// reales de BSD (no solo la documentación) al migrar el 3/9/2026.
 async function fetchMatchDetail(matchId) {
-  const infoRes = await apiGet(`/fixtures?id=${matchId}`);
-  const info = infoRes[0];
-  if (!info) throw new Error("Partido no encontrado");
-
-  const status = statusFromApi(info.fixture.status.short);
+  const info = await apiGet(`/events/${matchId}/`);
+  const status = statusFromBsd(info.status);
   const hasScore = status !== "scheduled";
+  const isLive = status === "live";
+
+  const wantStats = status !== "scheduled";
+  const wantPrediction = status === "scheduled";
+
+  const [statsRes, lineupsRes, predictionRes] = await Promise.all([
+    wantStats
+      ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
+          console.error(`[dataSource] no se pudo obtener estadísticas del partido ${matchId}:`, err.message);
+          return null;
+        })
+      : Promise.resolve(null),
+    apiGet(`/events/${matchId}/lineups/`).catch((err) => {
+      console.error(`[dataSource] no se pudo obtener alineación del partido ${matchId}:`, err.message);
+      return null;
+    }),
+    wantPrediction
+      ? apiGet(`/events/${matchId}/prediction/`).catch((err) => {
+          console.error(`[dataSource] no se pudo obtener pronóstico del partido ${matchId}:`, err.message);
+          return null;
+        })
+      : Promise.resolve(null),
+  ]);
 
   let statistics = null;
-  if (status !== "scheduled") {
-    const statsRes = await apiGet(`/fixtures/statistics?fixture=${matchId}`);
-    if (statsRes.length === 2) {
-      const [homeStats, awayStats] = statsRes;
-      statistics = homeStats.statistics
-        .map((s, i) => ({
-          label: s.type,
-          home: s.value,
-          away: awayStats.statistics[i]?.value ?? null,
-        }))
-        .filter((row) => row.home !== null || row.away !== null);
-    }
+  if (statsRes?.stats?.home && statsRes?.stats?.away) {
+    const LABELS = {
+      ball_possession: "Posesión (%)",
+      total_shots: "Remates",
+      shots_on_target: "Remates al arco",
+      shots_off_target: "Remates desviados",
+      blocked_shots: "Remates bloqueados",
+      corners: "Córners",
+      fouls: "Faltas",
+      yellow_cards: "Amarillas",
+      red_cards: "Rojas",
+      offsides: "Offsides",
+    };
+    const h = statsRes.stats.home;
+    const a = statsRes.stats.away;
+    statistics = Object.entries(LABELS)
+      .map(([key, label]) => ({ label, home: h[key] ?? null, away: a[key] ?? null }))
+      .filter((row) => row.home !== null || row.away !== null);
   }
 
   let lineups = null;
-  try {
-    const lineupsRes = await apiGet(`/fixtures/lineups?fixture=${matchId}`);
-    if (lineupsRes.length === 2) {
-      // "grid" viene como "fila:columna" (fila 1 = arquero, crece hacia
-      // adelante) — es lo que el frontend usa para dibujar la cancha con
-      // cada titular en su posición real. No todas las ligas la tienen
-      // cargada; cuando falta, el frontend arma las filas a partir de la
-      // formación ("4-4-2") como respaldo.
-      const buildSide = (side) => ({
-        teamId: side.team.id,
-        teamName: side.team.name,
+  if (lineupsRes && lineupsRes.lineup_status !== "unavailable" && lineupsRes.lineups) {
+    const buildSide = (side) =>
+      side && {
+        teamId: null,
+        teamName: side.team_name,
         formation: side.formation || null,
-        starters: (side.startXI || []).map((p) => ({
-          id: p.player.id,
-          name: p.player.name,
-          number: p.player.number,
-          position: p.player.pos,
-          grid: p.player.grid || null,
+        starters: (side.players || []).map((p) => ({
+          id: p.id,
+          name: p.short_name || p.name,
+          number: p.jersey_number,
+          position: p.position,
+          grid: null, // BSD no manda grid — el frontend arma filas desde "formation"
         })),
-      });
-      const home = lineupsRes.find((s) => s.team.id === info.teams.home.id);
-      const away = lineupsRes.find((s) => s.team.id === info.teams.away.id);
-      if (home?.startXI?.length || away?.startXI?.length) {
-        lineups = { home: buildSide(home), away: buildSide(away) };
-      }
+      };
+    const home = buildSide(lineupsRes.lineups.home);
+    const away = buildSide(lineupsRes.lineups.away);
+    if (home?.starters?.length || away?.starters?.length) {
+      lineups = { home, away };
     }
-  } catch (err) {
-    console.error(`[dataSource] no se pudo obtener alineación del partido ${matchId}:`, err.message);
   }
 
-  const predictions = status === "scheduled" ? await fetchPredictions(matchId) : null;
+  let predictions = null;
+  const matchResult = predictionRes?.markets?.match_result;
+  if (matchResult) {
+    const FAVORITE_LABEL = { H: "Gana el local", D: "Empatan", A: "Gana el visitante" };
+    const favorite = predictionRes.recommendations?.favorite;
+    predictions = {
+      home: matchResult.prob_home,
+      draw: matchResult.prob_draw,
+      away: matchResult.prob_away,
+      advice: favorite ? `Favorito: ${FAVORITE_LABEL[favorite] || favorite}` : null,
+    };
+  }
 
   return {
-    id: matchId,
+    id: Number(matchId),
     status,
-    elapsed: status === "live" ? info.fixture.status.elapsed ?? null : null,
-    statusShort: status === "live" ? info.fixture.status.short : null,
+    elapsed: isLive ? info.current_minute ?? null : null,
+    statusShort: isLive ? periodToShortCode(info.period || info.status) : null,
     home: {
-      id: info.teams.home.id,
-      name: info.teams.home.name,
-      crest: info.teams.home.logo || null,
-      score: hasScore ? info.goals.home : null,
+      id: info.home_team_id,
+      name: info.home_team,
+      crest: crestUrl(info.home_team_id),
+      score: hasScore ? info.home_score : null,
     },
     away: {
-      id: info.teams.away.id,
-      name: info.teams.away.name,
-      crest: info.teams.away.logo || null,
-      score: hasScore ? info.goals.away : null,
+      id: info.away_team_id,
+      name: info.away_team,
+      crest: crestUrl(info.away_team_id),
+      score: hasScore ? info.away_score : null,
     },
-    start: info.fixture.date,
+    start: info.event_date,
     statistics,
     lineups,
-    lineupsAreProbable: status === "scheduled",
+    lineupsAreProbable: lineupsRes?.lineup_status === "predicted",
     predictions,
   };
 }
@@ -433,5 +436,4 @@ module.exports = {
   searchLeagues,
   fetchTeamProfile,
   fetchMatchDetail,
-  LEAGUES,
 };
