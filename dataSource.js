@@ -196,7 +196,14 @@ function normalizeMatch(raw, leagues) {
     leagueCountry: league?.country || "World",
     status,
     elapsed: isLive ? raw.current_minute ?? null : null,
-    statusShort: isLive ? periodToShortCode(raw.period || raw.status) : null,
+    // raw.period trae la fase en texto localizado de BSD ("1T", "2T" —
+    // no encaja con PERIOD_TO_SHORT, pensado para los valores en inglés
+    // de raw.status). raw.status SÍ usa exactamente esos códigos
+    // ("1st_half", "halftime", "2nd_half", etc. — confirmado contra una
+    // respuesta real), así que es la fuente correcta acá. Con el period
+    // como primera opción, "DESC" (halftime) y "PENALES" no aparecían
+    // nunca: la key nunca calzaba con ningún valor de PERIOD_TO_SHORT.
+    statusShort: isLive ? periodToShortCode(raw.status) : null,
     home: raw.home_team,
     homeId: raw.home_team_id,
     homeAb: abbreviate(raw.home_team),
@@ -409,7 +416,7 @@ async function fetchMatchDetail(matchId) {
     id: Number(matchId),
     status,
     elapsed: isLive ? info.current_minute ?? null : null,
-    statusShort: isLive ? periodToShortCode(info.period || info.status) : null,
+    statusShort: isLive ? periodToShortCode(info.status) : null, // ver comentario en normalizeMatch
     home: {
       id: info.home_team_id,
       name: info.home_team,
