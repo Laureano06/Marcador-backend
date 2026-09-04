@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
 const rateLimit = require("express-rate-limit");
+const { ipKeyGenerator } = rateLimit;
 const {
   fetchMatchesForDate,
   searchTeams,
@@ -39,7 +40,11 @@ const apiLimiter = rateLimit({
   // mismo límite de 60/min (la IP del borde de Cloudflare), en vez de un
   // límite por visitante real. Sin Cloudflare (dev local, o pegándole al
   // .onrender.com directo) el header no está y cae a req.ip como antes.
-  keyGenerator: (req) => req.headers["cf-connecting-ip"] || req.ip,
+  // ipKeyGenerator normaliza IPv6 a su /56 (en vez de la dirección exacta):
+  // un solo visitante IPv6 puede rotar entre miles de direcciones dentro de
+  // su propio /56 y esquivar el límite si se compara la IP exacta — la
+  // librería lo marca como error de validación si no se envuelve así.
+  keyGenerator: (req) => ipKeyGenerator(req.headers["cf-connecting-ip"] || req.ip),
   message: { error: "Demasiadas requests, esperá un momento." },
 });
 app.use("/api/", apiLimiter);
