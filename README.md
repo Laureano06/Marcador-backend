@@ -70,15 +70,22 @@ bloqueado por la API.
 2. **La búsqueda de ligas casi no gasta nada** — reusa el mismo
    directorio de ligas que ya se cacheó para el feed del día (24hs).
 3. **TTL variable según el estado, no un número fijo para todo**: el feed
-   de partidos por fecha usa 20 min si es HOY (hay partidos en vivo), 6hs
-   si es una fecha futura (el fixture rara vez se reprograma), 7 días si
-   ya se jugó (el resultado final no cambia más). El detalle de un
-   partido puntual sigue la misma idea: 2 min si está EN VIVO o todavía
-   no arrancó (puede cambiar de estado en cualquier momento), pero **7
-   días si ya terminó** — un resultado, estadísticas y alineación de un
-   partido FINAL no cambian nunca más, así que una vez pedido no se
-   vuelve a pedir en toda la semana. 1 hora para búsquedas, 24hs para
-   fichas de equipo.
+   de partidos por fecha usa **1 min si es HOY** (hay partidos en vivo,
+   alineado con el polling de 60s del frontend — antes 20 min, heredado
+   del presupuesto de 100 req/día de API-Football, un TTL 20x más largo
+   que el propio polling que lo consumía), 6hs si es una fecha futura (el
+   fixture rara vez se reprograma), 7 días si ya se jugó (el resultado
+   final no cambia más). El detalle de un partido puntual sigue la misma
+   idea: **30s si está EN VIVO** (antes 2 min; el frontend ahora hace
+   polling en esa misma ventana mientras el partido sigue en vivo, ver
+   `MatchDetail.jsx`) o 2 min si todavía no arrancó, pero **7 días si ya
+   terminó** — un resultado, estadísticas y alineación de un partido
+   FINAL no cambian nunca más, así que una vez pedido no se vuelve a
+   pedir en toda la semana. 1 hora para búsquedas, 24hs para fichas de
+   equipo — estos dos no se achicaron: una ficha de equipo o un resultado
+   de búsqueda no cambian más seguido solo porque haya más cuota
+   disponible, achicar su TTL solo gastaría requests sin mejorar nada
+   real.
 4. **`quotaGuard.js` corta antes de las 7.500** (con margen de seguridad
    de 50), pase lo que pase. Si se llega al límite, la API devuelve un
    503 con `quotaExceeded: true` en vez de intentar la request igual.
@@ -96,8 +103,10 @@ bloqueado por la API.
    falta tocar nada a mano. Sigue siendo necesario por lo mismo de
    siempre: Render free duerme el servicio tras inactividad y lo reinicia
    en la próxima visita — sin persistencia, cada reinicio resetearía el
-   contador a 0 (riesgo real de mandar más de 100 requests reales en un
-   día) y vaciaría el cache. SQLite sobrevive a reinicios del mismo
+   contador a 0 (con 7.500/día el margen es mucho más amplio que con las
+   100 de API-Football, pero el riesgo de mandar de más contra una cuenta
+   que ya gastó su cuota real sigue siendo real) y vaciaría el cache.
+   SQLite sobrevive a reinicios del mismo
    contenedor igual que el JSON viejo, con escrituras atómicas por fila
    en vez de reescribir todo el archivo — pero **tampoco sobrevive a un
    redeploy nuevo** (Render pisa el filesystem igual). Para eso hace
@@ -111,25 +120,34 @@ bloqueado por la API.
    `server.js`): si el feed de HOY no está en cache, lo precarga en
    background sin bloquear que el server empiece a escuchar. Con el
    cache persistido (punto 6), en el caso normal esto no gasta nada.
-9. **El contador local se sincroniza si la API dice que la cuota REAL ya
-   se agotó** (`markExhausted()` en `quotaGuard.js`, disparado desde
-   `apiGet` en `dataSource.js` cuando un 429 trae `"code":
-   "taster_exhausted"`). El contador de este proceso solo sabe lo que ÉL
-   pidió — si la cuenta se quedó sin cuota por otra vía (otro proceso con
-   la misma key, o un redeploy que reinició el contador a 0 mientras la
-   cuenta seguía gastada del lado de BSD), sin esto seguiríamos mandando
-   requests reales que fallan igual, una por una, hasta que el margen de
-   seguridad las corte solo. Con esto, en cuanto la API contesta ese
-   error una vez, el proceso entero corta para el resto del día.
+9. **Refresh en background del feed de hoy** (`scheduleTodayRefresh()`
+   en `server.js`), cada `MATCHES_TTL_MS` (1 min) mientras el proceso
+   sigue despierto — con 100 req/día esto hubiera sido impagable (72
+   requests/día solo en refrescos, sin un solo visitante), pero con
+   7.500/día cuesta como mucho 1.440/día (menos del 20% del total) y a
+   cambio ningún visitante paga la latencia de la primera llamada en frío
+   a BSD, ni el score en vivo se queda pegado en una franja sin tráfico.
+   Usa el mismo `getOrFetch`, así que nunca duplica una request que ya
+   hizo un usuario real por su cuenta.
+10. **El contador local se sincroniza si la API dice que la cuota REAL ya
+    se agotó** (`markExhausted()` en `quotaGuard.js`, disparado desde
+    `apiGet` en `dataSource.js` cuando un 429 trae `"code":
+    "taster_exhausted"`). El contador de este proceso solo sabe lo que ÉL
+    pidió — si la cuenta se quedó sin cuota por otra vía (otro proceso con
+    la misma key, o un redeploy que reinició el contador a 0 mientras la
+    cuenta seguía gastada del lado de BSD), sin esto seguiríamos mandando
+    requests reales que fallan igual, una por una, hasta que el margen de
+    seguridad las corte solo. Con esto, en cuanto la API contesta ese
+    error una vez, el proceso entero corta para el resto del día.
 
-10. **Respuestas comprimidas (gzip)** — el feed de partidos de un día
+11. **Respuestas comprimidas (gzip)** — el feed de partidos de un día
     con muchas ligas puede pesar varios KB de JSON; con `compression`
     baja bastante en el aire, se nota sobre todo en 3G/4G.
-11. **Rate limiting por IP** (`express-rate-limit`, 60 req/min en
+12. **Rate limiting por IP** (`express-rate-limit`, 60 req/min en
     `/api/*`) — no protege la cuota en sí (eso lo hace quotaGuard, y
     pegarle a un endpoint cacheado no gasta requests reales), pero evita
     que un cliente en loop o un bot generen carga innecesaria.
-12. **`Cache-Control` en las respuestas**, con el tiempo de vida restante
+13. **`Cache-Control` en las respuestas**, con el tiempo de vida restante
     real del dato cacheado (no el TTL completo) — el browser (y
     cualquier CDN en el medio) puede reusar la respuesta sin volver a
     pegarle al backend, bajando también la carga ahí.
@@ -166,7 +184,8 @@ igual de necesario.
   de esta migración, ver nota más abajo).
 - `GET /api/matches/:id` — hasta 3 requests en paralelo (estadísticas si
   ya arrancó + alineación + pronóstico si todavía no arrancó, más la
-  info base). Cacheado 2 min (7 días si el partido ya es FINAL).
+  info base). Cacheado 30s si EN VIVO, 2 min si todavía no arrancó, 7
+  días si el partido ya es FINAL.
 - `GET /api/quota` — cuánto se gastó hoy, sin costo
 - `GET /health`
 

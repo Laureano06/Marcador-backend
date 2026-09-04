@@ -44,17 +44,24 @@ const apiLimiter = rateLimit({
 });
 app.use("/api/", apiLimiter);
 
-// TTLs pensados para cuidar la cuota diaria (7.500 req/día en el plan
-// free de BSD). Cuanto más caro es un dato de conseguir (o más lento
-// cambia), más tiempo lo reutilizamos — la cuota es mucho más generosa
-// que la de API-Football, pero no gratis: seguimos sin pedir de más algo
-// que ya sabemos que no cambió.
-const MATCHES_TTL_MS = 20 * 60 * 1000; // 20 min — HOY: hay partidos en vivo, cambia rápido
+// TTLs pensados para cuidar la cuota diaria. Los de datos EN VIVO (feed de
+// hoy, detalle en vivo) quedaron heredados de la migración de API-Football
+// (100 req/día): 20 min y 2 min respectivamente, calibrados para gastar lo
+// mínimo posible contra un presupuesto que ya no existe — el frontend hacía
+// polling cada 60s (Layout.jsx, POLL_MS) contra un cache de 20 min, así que
+// 19 de cada 20 minutos ese polling no traía nada nuevo. Con 7.500 req/día
+// de BSD (75x más) esos dos TTLs bajan a la frecuencia que el frontend
+// realmente pide, no a la mínima que la cuota vieja toleraba. Lo que NO
+// cambia con más cuota es la frecuencia REAL con la que cambian los datos
+// que no son "en vivo" — un fixture futuro o un resultado ya jugado no
+// cambian más seguido solo porque haya más presupuesto, así que esos TTLs
+// quedan igual.
+const MATCHES_TTL_MS = 60 * 1000; // 1 min — HOY: alineado con el polling del frontend (antes 20 min)
 const PAST_MATCHES_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — un día ya jugado no cambia más
 const FUTURE_MATCHES_TTL_MS = 6 * 60 * 60 * 1000; // 6 hs — fixture programado, rara vez se mueve
 const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
-const MATCH_DETAIL_TTL_MS = 2 * 60 * 1000; // 2 min — EN VIVO cambia rápido
+const MATCH_DETAIL_TTL_MS = 30 * 1000; // 30 s — EN VIVO, alineado con el nuevo polling de MatchDetail.jsx (antes 2 min)
 const MATCH_DETAIL_FINAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — FINAL no cambia nunca más
 
 // Un partido ya finalizado (resultado, estadísticas, alineación) no
@@ -280,8 +287,36 @@ async function warmCache() {
   }
 }
 
+// Mantiene el feed de HOY tibio en cache aunque no entre ninguna visita,
+// en vez de depender pura y exclusivamente de que un usuario dispare el
+// refetch al pedir una key ya vencida (el único modelo que el presupuesto
+// de 100 req/día podía pagarse). Con 7.500/día, refrescar cada
+// MATCHES_TTL_MS cuesta como mucho 1440 requests/día (86400s / 60s) — ni
+// el 20% del total — y a cambio ningún visitante paga la latencia de la
+// primera llamada en frío a BSD, ni el score en vivo se queda pegado en
+// una franja horaria sin tráfico (partidos de madrugada, por ejemplo).
+// getOrFetch ya resuelve el no-op cuando el cache sigue vigente, así que
+// este intervalo nunca duplica una request que ya se hizo por otra vía
+// (un usuario real, u otro tick de este mismo intervalo).
+function scheduleTodayRefresh() {
+  setInterval(async () => {
+    const today = todayKeyInTz();
+    const key = `matches:${today}`;
+    try {
+      await getOrFetch(key, () => fetchMatchesForDate(today), matchesTtlFor(today));
+    } catch (err) {
+      if (err instanceof QuotaExceededError || err instanceof AccountBlockedError) {
+        console.warn(`[refresh] ${err.name} — se salta este ciclo de refresh en background`);
+      } else {
+        console.warn("[refresh] no se pudo refrescar el feed de hoy en background:", err.message);
+      }
+    }
+  }, MATCHES_TTL_MS);
+}
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`[server] escuchando en http://localhost:${PORT}`);
   warmCache();
+  scheduleTodayRefresh();
 });
