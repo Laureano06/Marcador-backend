@@ -500,4 +500,5 @@ module.exports = {
   searchLeagues,
   fetchTeamProfile,
   fetchMatchDetail,
+  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
 };
