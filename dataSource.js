@@ -393,6 +393,20 @@ async function searchTeams(query) {
   }));
 }
 
+// Búsqueda de jugadores — /players/?name= hace match parcial e
+// insensible a tildes ("messi" encuentra "Messidoro") del lado de BSD,
+// no hace falta reimplementar ningún fuzzy-match acá.
+async function searchPlayers(query) {
+  const json = await apiGet(`/players/?name=${encodeURIComponent(query)}&limit=10`);
+  return listItems(json).map((p) => ({
+    id: p.id,
+    name: p.name,
+    teamId: p.current_team_id ?? null,
+    teamName: p.current_team?.name || null,
+    photo: playerPhotoUrl(p.id),
+  }));
+}
+
 // Búsqueda de ligas: usa el mismo directorio cacheado que el feed del
 // día (getLeagueDirectory) — normalmente no gasta una request nueva,
 // salvo la primera búsqueda del día si el feed todavía no lo cargó.
@@ -904,7 +918,7 @@ async function fetchCompetitionDetail(leagueId, seasonId) {
   const resolvedSeasonId = seasonId || league.current_season?.id;
 
   const seasonQuery = resolvedSeasonId ? `?season_id=${resolvedSeasonId}` : "";
-  const [standingsRes, scorersRes, assistsRes] = await Promise.all([
+  const [standingsRes, scorersRes, assistsRes, seasonsRes] = await Promise.all([
     apiGet(`/leagues/${leagueId}/standings/${seasonQuery}`).catch((err) => {
       console.error(`[dataSource] no se pudo obtener la tabla de la liga ${leagueId}:`, err.message);
       return null;
@@ -921,6 +935,13 @@ async function fetchCompetitionDetail(leagueId, seasonId) {
           return null;
         })
       : Promise.resolve(null),
+    // Historial de temporadas — punto 27 del plan. Un solo pedido extra
+    // (cacheado junto con el resto de la ficha), no una request por
+    // temporada: BSD ya devuelve la lista completa de una.
+    apiGet(`/leagues/${leagueId}/seasons/`).catch((err) => {
+      console.error(`[dataSource] no se pudieron obtener las temporadas de la liga ${leagueId}:`, err.message);
+      return null;
+    }),
   ]);
 
   let standings = null;
@@ -934,14 +955,28 @@ async function fetchCompetitionDetail(leagueId, seasonId) {
     standings = [{ groupName: null, rows: standingsRes.standings.map(normalizeStandingRow) }];
   }
 
+  const currentSeasonInfo = league.current_season
+    ? { id: league.current_season.id, name: league.current_season.name, year: league.current_season.year }
+    : null;
+  // Si se pidió una temporada puntual, mostramos ESA como "temporada
+  // actual de la pantalla" (para que el selector abajo marque la
+  // correcta) — currentSeasonInfo sigue siendo la de verdad, por si
+  // hace falta distinguir "estás viendo una vieja" en el frontend.
+  const viewingSeason =
+    seasonId && seasonsRes?.seasons?.find((s) => s.id === Number(seasonId))
+      ? seasonsRes.seasons.find((s) => s.id === Number(seasonId))
+      : league.current_season;
+
   return {
     id: league.id,
     name: league.name,
     country: league.country || null,
     logo: leagueLogoUrl(league.id),
     isWomen: !!league.is_women,
-    season: league.current_season
-      ? { id: league.current_season.id, name: league.current_season.name, year: league.current_season.year }
+    season: viewingSeason ? { id: viewingSeason.id, name: viewingSeason.name, year: viewingSeason.year } : null,
+    isCurrentSeason: !seasonId || seasonId === String(currentSeasonInfo?.id),
+    seasons: seasonsRes?.seasons?.length
+      ? seasonsRes.seasons.map((s) => ({ id: s.id, name: s.name, year: s.year }))
       : null,
     standings,
     topScorers: normalizeLeaderboard(scorersRes),
@@ -1049,9 +1084,57 @@ async function fetchVenueDetail(venueId) {
   };
 }
 
+// Solo estos filtros pasan tal cual a BSD — /transfers/ rechaza con 400
+// cualquier query param que no reconozca, así que un filtro mal escrito
+// del lado del frontend tiene que fallar accá con un error claro, no
+// llegar crudo a BSD y romper todo el pedido.
+const TRANSFER_FILTERS = [
+  "date_from",
+  "date_to",
+  "from_team_id",
+  "to_team_id",
+  "team_id",
+  "league_id",
+  "player_id",
+  "has_fee",
+  "min_fee",
+  "ordering",
+];
+
+// Mercado de pases — punto 19 del plan. `filters` es un objeto plano ya
+// validado por el caller (server.js), se arma la query string acá.
+async function fetchTransfers(filters = {}, limit = 25) {
+  const params = new URLSearchParams();
+  for (const key of TRANSFER_FILTERS) {
+    if (filters[key] != null && filters[key] !== "") params.set(key, filters[key]);
+  }
+  params.set("limit", Math.min(Number(limit) || 25, 50));
+
+  const json = await apiGet(`/transfers/?${params.toString()}`);
+  const results = listItems(json);
+
+  return {
+    count: json.count ?? results.length,
+    transfers: results.map((t) => ({
+      id: t.id,
+      date: t.transfer_date,
+      playerId: t.player?.id ?? null,
+      playerName: t.player?.name ?? null,
+      playerPhoto: playerPhotoUrl(t.player?.id),
+      fromTeamId: t.from_team_id,
+      fromTeamName: t.from_team_name,
+      toTeamId: t.to_team_id,
+      toTeamName: t.to_team_name,
+      feeEur: t.fee_eur ?? null,
+      feeDescription: t.fee_description || null,
+    })),
+  };
+}
+
 module.exports = {
   fetchMatchesForDate,
   searchTeams,
+  searchPlayers,
   searchLeagues,
   fetchTeamProfile,
   fetchMatchDetail,
@@ -1060,5 +1143,5 @@ module.exports = {
   fetchRefereeDetail,
   fetchManagerDetail,
   fetchVenueDetail,
-  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
+  fetchTransfers,
 };

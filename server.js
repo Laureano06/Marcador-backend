@@ -8,6 +8,7 @@ const {
   fetchMatchesForDate,
   searchTeams,
   searchLeagues,
+  searchPlayers,
   fetchTeamProfile,
   fetchMatchDetail,
   fetchPlayerDetail,
@@ -15,7 +16,7 @@ const {
   fetchRefereeDetail,
   fetchManagerDetail,
   fetchVenueDetail,
-  debugRawGet,
+  fetchTransfers,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -74,6 +75,7 @@ const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
 const PLAYER_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs — mismo criterio que el equipo: perfil/estadísticas de jugador no cambian a cada rato
 const COMPETITION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hs — tabla/goleadores cambian por jornada, no hace falta más frecuencia que esa
+const TRANSFERS_TTL_MS = 30 * 60 * 1000; // 30 min — puede entrar un fichaje nuevo en cualquier momento, pero no hace falta más frecuencia que esa
 const PERSON_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs — árbitro/DT/estadio: mismo criterio que jugador/equipo
 const MATCH_DETAIL_TTL_MS = 30 * 1000; // 30 s — EN VIVO, alineado con el nuevo polling de MatchDetail.jsx (antes 2 min)
 const MATCH_DETAIL_FINAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — FINAL no cambia nunca más
@@ -204,8 +206,8 @@ app.get("/api/search", async (req, res) => {
       key,
       async () => {
         console.log(`[api] buscando "${q}" en BSD...`);
-        const [teams, leagues] = await Promise.all([searchTeams(q), searchLeagues(q)]);
-        return { teams, leagues };
+        const [teams, leagues, players] = await Promise.all([searchTeams(q), searchLeagues(q), searchPlayers(q)]);
+        return { teams, leagues, players };
       },
       SEARCH_TTL_MS
     );
@@ -347,15 +349,27 @@ app.get("/api/venues/:id", async (req, res) => {
   }
 });
 
-// TEMPORAL — sacar después de inspeccionar formas de respuesta reales.
-app.get("/api/debug/raw", async (req, res) => {
-  const { path } = req.query;
-  if (!path) return res.status(400).json({ error: "Falta ?path=" });
+// GET /api/transfers?league_id=&team_id=&player_id=&date_from=&date_to=&has_fee=&min_fee=&ordering=&limit=
+// Cache por combinación exacta de filtros usados (mismo criterio que
+// /api/search: cada consulta distinta es una entrada de cache distinta).
+app.get("/api/transfers", async (req, res) => {
+  const { league_id, team_id, player_id, date_from, date_to, has_fee, min_fee, ordering, limit } = req.query;
+  const filters = { league_id, team_id, player_id, date_from, date_to, has_fee, min_fee, ordering };
+  const key = `transfers:${JSON.stringify(filters)}:${limit || 25}`;
   try {
-    const data = await debugRawGet(path);
-    res.json(data);
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo transferencias a BSD (${JSON.stringify(filters)})...`);
+        return fetchTransfers(filters, limit);
+      },
+      TRANSFERS_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
   }
 });
 
