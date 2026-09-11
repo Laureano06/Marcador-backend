@@ -1060,4 +1060,5 @@ module.exports = {
   fetchRefereeDetail,
   fetchManagerDetail,
   fetchVenueDetail,
+  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
 };
