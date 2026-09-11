@@ -349,12 +349,12 @@ app.get("/api/venues/:id", async (req, res) => {
   }
 });
 
-// GET /api/transfers?league_id=&team_id=&player_id=&date_from=&date_to=&has_fee=&min_fee=&ordering=&limit=
+// GET /api/transfers?league_id=&team_id=&player_id=&date_from=&date_to=&has_fee=&min_fee=&ordering=&offset=&limit=
 // Cache por combinación exacta de filtros usados (mismo criterio que
 // /api/search: cada consulta distinta es una entrada de cache distinta).
 app.get("/api/transfers", async (req, res) => {
-  const { league_id, team_id, player_id, date_from, date_to, has_fee, min_fee, ordering, limit } = req.query;
-  const filters = { league_id, team_id, player_id, date_from, date_to, has_fee, min_fee, ordering };
+  const { league_id, team_id, player_id, date_from, date_to, has_fee, min_fee, ordering, offset, limit } = req.query;
+  const filters = { league_id, team_id, player_id, date_from, date_to, has_fee, min_fee, ordering, offset };
   const key = `transfers:${JSON.stringify(filters)}:${limit || 25}`;
   try {
     await getOrFetch(

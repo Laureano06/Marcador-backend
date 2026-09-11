@@ -1099,6 +1099,7 @@ const TRANSFER_FILTERS = [
   "has_fee",
   "min_fee",
   "ordering",
+  "offset",
 ];
 
 // Mercado de pases — punto 19 del plan. `filters` es un objeto plano ya
