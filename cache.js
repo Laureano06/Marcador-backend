@@ -39,4 +39,9 @@ function isExpired(key) {
   return Date.now() - row.updatedAt > row.ttlMs;
 }
 
-module.exports = { getCached, getCachedMeta, setCached, isExpired };
+const stmtDelete = db.prepare("DELETE FROM cache WHERE key = ?");
+function deleteCached(key) {
+  stmtDelete.run(key);
+}
+
+module.exports = { getCached, getCachedMeta, setCached, isExpired, deleteCached };

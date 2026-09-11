@@ -11,7 +11,7 @@ const {
   fetchTeamProfile,
   fetchMatchDetail,
 } = require("./dataSource");
-const { getCached, getCachedMeta, isExpired } = require("./cache");
+const { getCached, getCachedMeta, isExpired, deleteCached } = require("./cache");
 const { getOrFetch } = require("./withCache");
 const { getUsage, QuotaExceededError, AccountBlockedError } = require("./quotaGuard");
 
@@ -249,6 +249,19 @@ app.get("/api/matches/:id", async (req, res) => {
     const stale = getCached(key);
     handleError(res, err, stale && { ...stale, stale: true });
   }
+});
+
+// TEMPORAL — sacar después de usarlo una vez: limpia una entrada puntual
+// del cache de partidos (matches:YYYY-MM-DD). Necesario porque el deploy
+// del fix de zona horaria (ver dataSource.js) coincidió con un request en
+// vuelo que alcanzó a cachear "ayer" con el resultado viejo (7 días de
+// TTL por ser una fecha pasada) — sin esto ese día puntual quedaría mal
+// hasta que ese TTL venza solo.
+app.get("/api/admin/clear-matches-cache", (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "Falta ?date=YYYY-MM-DD" });
+  deleteCached(`matches:${date}`);
+  res.json({ cleared: `matches:${date}` });
 });
 
 // GET /api/quota -> transparencia sobre cuánto llevamos gastado hoy.
