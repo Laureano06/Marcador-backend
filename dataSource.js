@@ -517,8 +517,19 @@ async function fetchMatchDetail(matchId) {
   const wantStats = status !== "scheduled";
   const wantPrediction = status === "scheduled";
 
-  const [statsRes, lineupsRes, predictionRes, incidentsRes, playerStatsRes, homeForm, awayForm, refereeRes, venueRes] =
-    await Promise.all([
+  const [
+    statsRes,
+    lineupsRes,
+    predictionRes,
+    incidentsRes,
+    playerStatsRes,
+    homeForm,
+    awayForm,
+    refereeRes,
+    venueRes,
+    homeCoachRes,
+    awayCoachRes,
+  ] = await Promise.all([
       wantStats
         ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
             console.error(`[dataSource] no se pudo obtener estadísticas del partido ${matchId}:`, err.message);
@@ -553,6 +564,12 @@ async function fetchMatchDetail(matchId) {
         ? apiGet(`/referees/${info.referee_id}/`).catch(() => null)
         : Promise.resolve(null),
       info.venue_id ? apiGet(`/venues/${info.venue_id}/`).catch(() => null) : Promise.resolve(null),
+      info.home_coach_id
+        ? apiGet(`/managers/${info.home_coach_id}/`).catch(() => null)
+        : Promise.resolve(null),
+      info.away_coach_id
+        ? apiGet(`/managers/${info.away_coach_id}/`).catch(() => null)
+        : Promise.resolve(null),
     ]);
 
   let statistics = null;
@@ -722,12 +739,14 @@ async function fetchMatchDetail(matchId) {
       name: info.home_team,
       crest: crestUrl(info.home_team_id),
       score: hasScore ? info.home_score : null,
+      coach: homeCoachRes ? { id: homeCoachRes.id, name: homeCoachRes.name } : null,
     },
     away: {
       id: info.away_team_id,
       name: info.away_team,
       crest: crestUrl(info.away_team_id),
       score: hasScore ? info.away_score : null,
+      coach: awayCoachRes ? { id: awayCoachRes.id, name: awayCoachRes.name } : null,
     },
     start: info.event_date,
     stageName: info.stage_name || null,
