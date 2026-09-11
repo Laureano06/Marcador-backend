@@ -219,17 +219,49 @@ function normalizeMatch(raw, leagues) {
   };
 }
 
-// TODOS los partidos de TODAS las ligas cubiertas para un día puntual.
-// Paginado por las dudas (30+ ligas normalmente entra en una página de
-// 200, pero una fecha con muchos partidos podría no entrar).
-async function fetchMatchesForDate(dateStr) {
-  const leagues = await getLeagueDirectory();
+// Mismo valor que TIMEZONE en server.js (duplicado a propósito: server.js
+// requiere este archivo, no al revés — importarlo de vuelta crearía una
+// dependencia circular por un solo string). Si se cambia acá, cambiar
+// también allá.
+const APP_TIMEZONE =
+  process.env.APP_TIMEZONE || process.env.API_FOOTBALL_TIMEZONE || "America/Argentina/Buenos_Aires";
+const ARG_DATE_FMT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: APP_TIMEZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+function addUtcDay(dateStr, delta = 1) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  date.setUTCDate(date.getUTCDate() + delta);
+  return date.toISOString().slice(0, 10);
+}
+
+// BSD filtra date_from/date_to por el día CALENDARIO UTC del evento, no
+// por el día calendario de Argentina — confirmado en producción el
+// 11/9/2026: un partido de las 21:30 hora Argentina (Independiente del
+// Valle 0-2 Flamengo, Libertadores) tiene event_date en UTC ya del día
+// SIGUIENTE (Argentina es UTC-3, así que desde las 21hs todo lo que pasa
+// ya cayó en el día UTC de mañana) y aparecía bajo "HOY" en vez de bajo
+// el día en que Argentina lo vivió como "anoche". Por eso NO se puede
+// pedirle a BSD directamente "los partidos del día X de Argentina": hay
+// que traer el día UTC X Y el día UTC X+1 (el rango que puede contener
+// partidos de la noche argentina de X) y quedarse solo con los que,
+// convertidos a hora de Argentina, caen realmente en X.
+let rawEventsByUtcDate = new Map(); // utcDateStr -> { data, at }
+const RAW_EVENTS_TTL_MS = 60 * 1000; // igual al TTL de "hoy" en server.js
+
+async function fetchRawEventsForUtcDate(utcDateStr) {
+  const cached = rawEventsByUtcDate.get(utcDateStr);
+  if (cached && Date.now() - cached.at < RAW_EVENTS_TTL_MS) return cached.data;
 
   const all = [];
   let offset = 0;
   for (let page = 0; page < 10; page++) {
     const json = await apiGet(
-      `/events/?date_from=${dateStr}&date_to=${dateStr}&limit=200&offset=${offset}`
+      `/events/?date_from=${utcDateStr}&date_to=${utcDateStr}&limit=200&offset=${offset}`
     );
     const items = listItems(json);
     all.push(...items);
@@ -237,7 +269,32 @@ async function fetchMatchesForDate(dateStr) {
     offset += 200;
   }
 
-  return all.map((raw) => normalizeMatch(raw, leagues)).sort((a, b) => a.start.localeCompare(b.start));
+  rawEventsByUtcDate.set(utcDateStr, { data: all, at: Date.now() });
+  return all;
+}
+
+// TODOS los partidos de TODAS las ligas cubiertas para un día puntual DE
+// ARGENTINA (dateStr). Ver el comentario de fetchRawEventsForUtcDate para
+// el porqué de pedir dos días UTC en vez de uno.
+async function fetchMatchesForDate(dateStr) {
+  const leagues = await getLeagueDirectory();
+  const nextUtcDate = addUtcDay(dateStr);
+
+  const [dayEvents, nextDayEvents] = await Promise.all([
+    fetchRawEventsForUtcDate(dateStr),
+    fetchRawEventsForUtcDate(nextUtcDate),
+  ]);
+
+  const byId = new Map();
+  for (const raw of [...dayEvents, ...nextDayEvents]) {
+    if (ARG_DATE_FMT.format(new Date(raw.event_date)) === dateStr) {
+      byId.set(raw.id, raw);
+    }
+  }
+
+  return [...byId.values()]
+    .map((raw) => normalizeMatch(raw, leagues))
+    .sort((a, b) => a.start.localeCompare(b.start));
 }
 
 // Busca equipos por nombre. 1 request por texto de búsqueda (se cachea
