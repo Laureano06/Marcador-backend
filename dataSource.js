@@ -468,6 +468,38 @@ async function fetchTeamProfile(teamId) {
   };
 }
 
+// Últimos resultados de un equipo ANTES de una fecha dada (para mostrar
+// la forma reciente en la ficha del partido: quién llega mejor). Pide
+// una ventana amplia (300 días) para no quedarse corto con equipos de
+// competencias que juegan poco seguido, y filtra/ordena/recorta a 5 acá
+// — BSD no tiene un parámetro "dame los últimos N finalizados".
+async function fetchRecentForm(teamId, beforeIso) {
+  try {
+    const from = new Date(new Date(beforeIso).getTime() - 300 * 24 * 60 * 60 * 1000).toISOString();
+    const json = await apiGet(
+      `/teams/${teamId}/fixtures/?status=finished&limit=20&date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(beforeIso)}`
+    );
+    const events = listItems(json).filter((e) => e.home_score != null && e.away_score != null);
+    events.sort((a, b) => b.event_date.localeCompare(a.event_date));
+    return events.slice(0, 5).map((e) => {
+      const isHome = e.home_team_id === Number(teamId);
+      const gf = isHome ? e.home_score : e.away_score;
+      const ga = isHome ? e.away_score : e.home_score;
+      return {
+        result: gf > ga ? "W" : gf < ga ? "L" : "D",
+        goalsFor: gf,
+        goalsAgainst: ga,
+        opponent: isHome ? e.away_team : e.home_team,
+        isHome,
+        date: e.event_date,
+      };
+    });
+  } catch (err) {
+    console.error(`[dataSource] no se pudo obtener la forma reciente del equipo ${teamId}:`, err.message);
+    return null;
+  }
+}
+
 // Detalle de UN partido: info base + estadísticas/eventos (si ya arrancó)
 // + alineación + pronóstico (si todavía no arrancó) — todo en paralelo.
 // info YA trae mucho más de lo que se leía antes (stage/round, clima,
@@ -485,30 +517,39 @@ async function fetchMatchDetail(matchId) {
   const wantStats = status !== "scheduled";
   const wantPrediction = status === "scheduled";
 
-  const [statsRes, lineupsRes, predictionRes, incidentsRes] = await Promise.all([
-    wantStats
-      ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
-          console.error(`[dataSource] no se pudo obtener estadísticas del partido ${matchId}:`, err.message);
-          return null;
-        })
-      : Promise.resolve(null),
-    apiGet(`/events/${matchId}/lineups/`).catch((err) => {
-      console.error(`[dataSource] no se pudo obtener alineación del partido ${matchId}:`, err.message);
-      return null;
-    }),
-    wantPrediction
-      ? apiGet(`/events/${matchId}/prediction/`).catch((err) => {
-          console.error(`[dataSource] no se pudo obtener pronóstico del partido ${matchId}:`, err.message);
-          return null;
-        })
-      : Promise.resolve(null),
-    wantStats
-      ? apiGet(`/events/${matchId}/incidents/`).catch((err) => {
-          console.error(`[dataSource] no se pudo obtener eventos del partido ${matchId}:`, err.message);
-          return null;
-        })
-      : Promise.resolve(null),
-  ]);
+  const [statsRes, lineupsRes, predictionRes, incidentsRes, playerStatsRes, homeForm, awayForm] =
+    await Promise.all([
+      wantStats
+        ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
+            console.error(`[dataSource] no se pudo obtener estadísticas del partido ${matchId}:`, err.message);
+            return null;
+          })
+        : Promise.resolve(null),
+      apiGet(`/events/${matchId}/lineups/`).catch((err) => {
+        console.error(`[dataSource] no se pudo obtener alineación del partido ${matchId}:`, err.message);
+        return null;
+      }),
+      wantPrediction
+        ? apiGet(`/events/${matchId}/prediction/`).catch((err) => {
+            console.error(`[dataSource] no se pudo obtener pronóstico del partido ${matchId}:`, err.message);
+            return null;
+          })
+        : Promise.resolve(null),
+      wantStats
+        ? apiGet(`/events/${matchId}/incidents/`).catch((err) => {
+            console.error(`[dataSource] no se pudo obtener eventos del partido ${matchId}:`, err.message);
+            return null;
+          })
+        : Promise.resolve(null),
+      wantStats
+        ? apiGet(`/events/${matchId}/player-stats/`).catch((err) => {
+            console.error(`[dataSource] no se pudieron obtener estadísticas de jugadores del partido ${matchId}:`, err.message);
+            return null;
+          })
+        : Promise.resolve(null),
+      info.home_team_id ? fetchRecentForm(info.home_team_id, info.event_date) : Promise.resolve(null),
+      info.away_team_id ? fetchRecentForm(info.away_team_id, info.event_date) : Promise.resolve(null),
+    ]);
 
   let statistics = null;
   let shotmap = null;
@@ -609,6 +650,30 @@ async function fetchMatchDetail(matchId) {
       ? incidentsRes.incidents.map(normalizeIncident).filter(Boolean)
       : null;
 
+  // Estadísticas individuales de cada jugador que participó — no trae
+  // nombre, solo player_id (se resuelve del lado del frontend contra la
+  // alineación, que ya viaja en la misma respuesta).
+  const playerStats = playerStatsRes?.player_stats?.length
+    ? playerStatsRes.player_stats.map((p) => ({
+        playerId: p.player_id,
+        teamId: p.team_id,
+        minutesPlayed: p.minutes_played,
+        rating: p.rating ?? null,
+        goals: p.goals,
+        assists: p.goal_assist,
+        xg: p.expected_goals ?? null,
+        xa: p.expected_assists ?? null,
+        shots: p.total_shots,
+        shotsOnTarget: p.shots_on_target,
+        passes: p.total_pass,
+        accuratePasses: p.accurate_pass,
+        duelsWon: p.duel_won,
+        yellowCards: p.yellow_card,
+        redCards: p.red_card,
+        saves: p.saves,
+      }))
+    : null;
+
   let predictions = null;
   const matchResult = predictionRes?.markets?.match_result;
   if (matchResult) {
@@ -667,11 +732,13 @@ async function fetchMatchDetail(matchId) {
     attendance: info.attendance ?? null,
     weather,
     h2h,
+    form: homeForm?.length || awayForm?.length ? { home: homeForm, away: awayForm } : null,
     highlights: info.highlights?.length ? info.highlights : null,
     statistics,
     shotmap,
     xg,
     events,
+    playerStats,
     lineups,
     lineupsAreProbable: lineupsRes?.lineup_status === "predicted",
     unavailablePlayers,
@@ -763,5 +830,4 @@ module.exports = {
   fetchTeamProfile,
   fetchMatchDetail,
   fetchPlayerDetail,
-  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
 };
