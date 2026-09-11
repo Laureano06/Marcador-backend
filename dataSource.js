@@ -183,6 +183,85 @@ function crestUrl(teamId) {
   return teamId ? `${IMG_BASE}/team/${teamId}/?bg=transparent` : null;
 }
 
+// Mismo patrón que crestUrl pero para jugadores — "sor=true&bg=transparent"
+// pide el recorte SIN fondo (lo más parecido a una foto "cutout") en vez
+// del retrato de perfil común, que es lo que BSD tiene para ofrecer acá.
+function playerPhotoUrl(playerId) {
+  return playerId ? `${IMG_BASE}/player/${playerId}/?sor=true&bg=transparent` : null;
+}
+
+function normalizeIncident(raw) {
+  if (raw.type === "goal") {
+    return {
+      type: "goal",
+      minute: raw.minute,
+      addedTime: raw.added_time ?? null,
+      isHome: raw.is_home,
+      playerId: raw.player_id ?? null,
+      player: raw.player,
+      assistPlayerId: null, // BSD no manda el id del asistente, solo el nombre
+      assist: raw.assist || null,
+      goalType: raw.goal_type || null, // "regular" | "penalty" | "own_goal" (valores vistos en producción)
+      score: { home: raw.home_score, away: raw.away_score },
+    };
+  }
+  if (raw.type === "card") {
+    return {
+      type: "card",
+      minute: raw.minute,
+      addedTime: raw.added_time ?? null,
+      isHome: raw.is_home,
+      playerId: raw.player_id ?? null,
+      player: raw.player,
+      cardType: raw.card_type, // "yellow" | "red"
+      reason: raw.reason || null,
+    };
+  }
+  if (raw.type === "substitution") {
+    return {
+      type: "substitution",
+      minute: raw.minute,
+      addedTime: raw.added_time ?? null,
+      isHome: raw.is_home,
+      playerInId: raw.player_in_id ?? null,
+      playerIn: raw.player_in,
+      playerOutId: raw.player_out_id ?? null,
+      playerOut: raw.player_out,
+    };
+  }
+  if (raw.type === "period") {
+    return {
+      type: "period",
+      minute: raw.minute,
+      label: raw.text, // "HT" | "FT" | ...
+      score: { home: raw.home_score, away: raw.away_score },
+    };
+  }
+  return null; // "injuryTime" y cualquier tipo nuevo no documentado: no aportan nada al usuario, se descartan acá en vez de en el frontend
+}
+
+// Estadísticas EXTRA más allá de las 10 básicas de siempre — todas salen
+// de la MISMA respuesta de /stats/ que ya se pedía (sin costo extra de
+// cuota), BSD simplemente manda muchos más campos de los que se leían.
+// Selección deliberadamente acotada: las más entendibles para alguien
+// que no vive mirando estadísticas avanzadas de fútbol.
+const EXTENDED_STAT_LABELS = [
+  ["big_chances_scored", "Grandes ocasiones convertidas"],
+  ["big_chances_missed", "Grandes ocasiones falladas"],
+  ["accurate_passes", "Pases precisos"],
+  ["pass_accuracy_pct", "Precisión de pase (%)"],
+  ["duels", "Duelos ganados"],
+  ["aerial_duels_pct", "Duelos aéreos ganados (%)"],
+  ["total_saves", "Atajadas"],
+];
+// Un par de campos vienen como {value,total,pct} en vez de un número
+// suelto (ver aerial_duels en la respuesta real de /stats/) — se
+// extraen a su propia clave plana acá para que el resto del mapeo no
+// tenga que saber cuáles son "raros".
+function flattenStatsSide(side) {
+  return { ...side, aerial_duels_pct: side.aerial_duels?.pct ?? null };
+}
+
 function normalizeMatch(raw, leagues) {
   const status = statusFromBsd(raw.status);
   const hasScore = status !== "scheduled";
@@ -365,7 +444,7 @@ async function fetchTeamProfile(teamId) {
     number: p.jersey_number,
     position: POSITION_EXPAND[p.position] || p.position || "Otros",
     age: p.date_of_birth ? ageFromDob(p.date_of_birth) : null,
-    photo: `${IMG_BASE}/player/${p.id}/?sor=true&bg=transparent`,
+    photo: playerPhotoUrl(p.id),
   }));
 
   return {
@@ -379,12 +458,14 @@ async function fetchTeamProfile(teamId) {
   };
 }
 
-// Detalle de UN partido: info base + estadísticas (si ya arrancó) +
-// alineación + pronóstico (si todavía no arrancó), estadísticas/alineación
-// y pronóstico en paralelo.
+// Detalle de UN partido: info base + estadísticas/eventos (si ya arrancó)
+// + alineación + pronóstico (si todavía no arrancó) — todo en paralelo.
+// info YA trae mucho más de lo que se leía antes (stage/round, clima,
+// asistencia, H2H, highlights) sin ningún pedido extra; lo único
+// GENUINAMENTE nuevo acá es /incidents/ (eventos del partido).
 //
-// El mapeo de /stats/ y /prediction/ está verificado contra respuestas
-// reales de BSD (no solo la documentación) al migrar el 3/9/2026.
+// El mapeo de /stats/, /incidents/ y /prediction/ está verificado contra
+// respuestas reales de BSD (no solo la documentación).
 async function fetchMatchDetail(matchId) {
   const info = await apiGet(`/events/${matchId}/`);
   const status = statusFromBsd(info.status);
@@ -394,7 +475,7 @@ async function fetchMatchDetail(matchId) {
   const wantStats = status !== "scheduled";
   const wantPrediction = status === "scheduled";
 
-  const [statsRes, lineupsRes, predictionRes] = await Promise.all([
+  const [statsRes, lineupsRes, predictionRes, incidentsRes] = await Promise.all([
     wantStats
       ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
           console.error(`[dataSource] no se pudo obtener estadísticas del partido ${matchId}:`, err.message);
@@ -411,43 +492,82 @@ async function fetchMatchDetail(matchId) {
           return null;
         })
       : Promise.resolve(null),
+    wantStats
+      ? apiGet(`/events/${matchId}/incidents/`).catch((err) => {
+          console.error(`[dataSource] no se pudo obtener eventos del partido ${matchId}:`, err.message);
+          return null;
+        })
+      : Promise.resolve(null),
   ]);
 
   let statistics = null;
+  let shotmap = null;
+  let xg = null;
   if (statsRes?.stats?.home && statsRes?.stats?.away) {
-    const LABELS = {
-      ball_possession: "Posesión (%)",
-      total_shots: "Remates",
-      shots_on_target: "Remates al arco",
-      shots_off_target: "Remates desviados",
-      blocked_shots: "Remates bloqueados",
-      corners: "Córners",
-      fouls: "Faltas",
-      yellow_cards: "Amarillas",
-      red_cards: "Rojas",
-      offsides: "Offsides",
-    };
-    const h = statsRes.stats.home;
-    const a = statsRes.stats.away;
-    statistics = Object.entries(LABELS)
+    const BASE_LABELS = [
+      ["ball_possession", "Posesión (%)"],
+      ["total_shots", "Remates"],
+      ["shots_on_target", "Remates al arco"],
+      ["shots_off_target", "Remates desviados"],
+      ["blocked_shots", "Remates bloqueados"],
+      ["corners", "Córners"],
+      ["fouls", "Faltas"],
+      ["yellow_cards", "Amarillas"],
+      ["red_cards", "Rojas"],
+      ["offsides", "Offsides"],
+    ];
+    const h = flattenStatsSide(statsRes.stats.home);
+    const a = flattenStatsSide(statsRes.stats.away);
+    statistics = [...BASE_LABELS, ...EXTENDED_STAT_LABELS]
       .map(([key, label]) => ({ label, home: h[key] ?? null, away: a[key] ?? null }))
       .filter((row) => row.home !== null || row.away !== null);
+
+    if (Array.isArray(statsRes.shotmap) && statsRes.shotmap.length > 0) {
+      shotmap = statsRes.shotmap.map((s) => ({
+        playerId: s.player_id ?? null,
+        isHome: !!s.home,
+        minute: s.min,
+        addedTime: s.added ?? null,
+        x: s.pos?.x ?? null,
+        y: s.pos?.y ?? null,
+        xg: s.xg ?? null,
+        xgot: s.xgot ?? null,
+        result: s.type, // "goal" | "miss" | "save" | "block" (valores vistos en producción)
+        bodyPart: s.body || null,
+        situation: s.sit || null,
+        estimated: !!s.xg_estimated,
+      }));
+    }
+
+    const homeXg = statsRes.stats.home.xg;
+    const awayXg = statsRes.stats.away.xg;
+    if (homeXg && awayXg) {
+      xg = {
+        home: homeXg.actual,
+        away: awayXg.actual,
+        estimated: !!statsRes.xg_estimated,
+        perMinute: Array.isArray(statsRes.xg_per_minute) ? statsRes.xg_per_minute : null,
+      };
+    }
   }
 
   let lineups = null;
   if (lineupsRes && lineupsRes.lineup_status !== "unavailable" && lineupsRes.lineups) {
+    const buildPlayer = (p) => ({
+      id: p.id,
+      name: p.short_name || p.name,
+      number: p.jersey_number,
+      position: p.position,
+      photo: playerPhotoUrl(p.id),
+      grid: null, // BSD no manda grid — el frontend arma filas desde "formation"
+    });
     const buildSide = (side) =>
       side && {
-        teamId: null,
+        teamId: side.team_id ?? null,
         teamName: side.team_name,
         formation: side.formation || null,
-        starters: (side.players || []).map((p) => ({
-          id: p.id,
-          name: p.short_name || p.name,
-          number: p.jersey_number,
-          position: p.position,
-          grid: null, // BSD no manda grid — el frontend arma filas desde "formation"
-        })),
+        starters: (side.players || []).map(buildPlayer),
+        substitutes: (side.substitutes || []).map(buildPlayer),
       };
     const home = buildSide(lineupsRes.lineups.home);
     const away = buildSide(lineupsRes.lineups.away);
@@ -455,6 +575,29 @@ async function fetchMatchDetail(matchId) {
       lineups = { home, away };
     }
   }
+
+  // "Bajas" (lesionados/suspendidos/dudosos) viene en la MISMA respuesta
+  // de lineups, así que sale gratis en cuanto lineupsRes existe — no
+  // depende de que la alineación en sí esté confirmada.
+  let unavailablePlayers = null;
+  const buildUnavailable = (list) =>
+    (list || []).map((p) => ({
+      id: p.id,
+      name: p.short_name || p.name,
+      status: p.status, // "injured" | "suspended" | "doubtful"
+      reason: p.reason || null,
+    }));
+  if (lineupsRes?.unavailable_players?.home?.length || lineupsRes?.unavailable_players?.away?.length) {
+    unavailablePlayers = {
+      home: buildUnavailable(lineupsRes.unavailable_players.home),
+      away: buildUnavailable(lineupsRes.unavailable_players.away),
+    };
+  }
+
+  const events =
+    incidentsRes?.incidents?.length > 0
+      ? incidentsRes.incidents.map(normalizeIncident).filter(Boolean)
+      : null;
 
   let predictions = null;
   const matchResult = predictionRes?.markets?.match_result;
@@ -468,6 +611,27 @@ async function fetchMatchDetail(matchId) {
       advice: favorite ? `Favorito: ${FAVORITE_LABEL[favorite] || favorite}` : null,
     };
   }
+
+  const h2h = info.head_to_head
+    ? {
+        totalMatches: info.head_to_head.total_matches,
+        homeWins: info.head_to_head.home_wins,
+        draws: info.head_to_head.draws,
+        awayWins: info.head_to_head.away_wins,
+        homeGoals: info.head_to_head.home_goals,
+        awayGoals: info.head_to_head.away_goals,
+        recentMatches: (info.head_to_head.recent_matches || []).slice(0, 10),
+      }
+    : null;
+
+  const weather =
+    info.weather && (info.weather.temperature_c != null || info.weather.description)
+      ? {
+          description: info.weather.description || null,
+          temperatureC: info.weather.temperature_c ?? null,
+          windSpeed: info.weather.wind_speed ?? null,
+        }
+      : null;
 
   return {
     id: Number(matchId),
@@ -487,10 +651,98 @@ async function fetchMatchDetail(matchId) {
       score: hasScore ? info.away_score : null,
     },
     start: info.event_date,
+    stageName: info.stage_name || null,
+    roundLabel: info.round_label || null,
+    isDerby: !!info.is_local_derby,
+    attendance: info.attendance ?? null,
+    weather,
+    h2h,
+    highlights: info.highlights?.length ? info.highlights : null,
     statistics,
+    shotmap,
+    xg,
+    events,
     lineups,
     lineupsAreProbable: lineupsRes?.lineup_status === "predicted",
+    unavailablePlayers,
     predictions,
+  };
+}
+
+// Ficha de UN jugador: perfil + una página de sus estadísticas por
+// partido (BSD las pagina de a 50, sin filtro de temporada disponible
+// acá — se muestra como "últimos partidos registrados", no como
+// "temporada actual", para no afirmar algo que no se puede verificar
+// sin cruzar fecha por fecha cada evento).
+async function fetchPlayerDetail(playerId) {
+  const [info, statsRes] = await Promise.all([
+    apiGet(`/players/${playerId}/`),
+    apiGet(`/players/${playerId}/stats/`).catch((err) => {
+      console.error(`[dataSource] no se pudieron obtener estadísticas del jugador ${playerId}:`, err.message);
+      return null;
+    }),
+  ]);
+
+  const records = statsRes?.results || [];
+  const totals = records.reduce(
+    (acc, r) => ({
+      appearances: acc.appearances + 1,
+      minutes: acc.minutes + (r.minutes_played || 0),
+      goals: acc.goals + (r.goals || 0),
+      assists: acc.assists + (r.goal_assist || 0),
+      shots: acc.shots + (r.total_shots || 0),
+      shotsOnTarget: acc.shotsOnTarget + (r.shots_on_target || 0),
+      yellowCards: acc.yellowCards + (r.yellow_card || 0),
+      redCards: acc.redCards + (r.red_card || 0),
+      ratingSum: acc.ratingSum + (r.rating || 0),
+      ratedMatches: acc.ratedMatches + (r.rating ? 1 : 0),
+    }),
+    {
+      appearances: 0,
+      minutes: 0,
+      goals: 0,
+      assists: 0,
+      shots: 0,
+      shotsOnTarget: 0,
+      yellowCards: 0,
+      redCards: 0,
+      ratingSum: 0,
+      ratedMatches: 0,
+    }
+  );
+
+  return {
+    id: info.id,
+    name: info.name,
+    shortName: info.short_name || info.name,
+    position: POSITION_EXPAND[info.position] || info.position || null,
+    number: info.jersey_number,
+    photo: playerPhotoUrl(info.id),
+    age: info.date_of_birth ? ageFromDob(info.date_of_birth) : null,
+    heightCm: info.height_cm ?? null,
+    preferredFoot: info.preferred_foot === "R" ? "Derecho" : info.preferred_foot === "L" ? "Izquierdo" : null,
+    nationality: info.nationality || null,
+    teamId: info.current_team_id ?? null,
+    teamName: info.current_team?.name || null,
+    marketValueEur: info.market_value_eur ?? null,
+    contractUntil: info.contract_until || null,
+    availability: info.availability || null,
+    injuryType: info.injury_type || null,
+    stats:
+      records.length > 0
+        ? {
+            sampleSize: records.length,
+            appearances: totals.appearances,
+            minutes: totals.minutes,
+            goals: totals.goals,
+            assists: totals.assists,
+            shots: totals.shots,
+            shotsOnTarget: totals.shotsOnTarget,
+            yellowCards: totals.yellowCards,
+            redCards: totals.redCards,
+            averageRating: totals.ratedMatches > 0 ? totals.ratingSum / totals.ratedMatches : null,
+          }
+        : null,
   };
 }
 
@@ -500,5 +752,5 @@ module.exports = {
   searchLeagues,
   fetchTeamProfile,
   fetchMatchDetail,
-  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
+  fetchPlayerDetail,
 };

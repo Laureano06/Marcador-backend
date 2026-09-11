@@ -10,7 +10,7 @@ const {
   searchLeagues,
   fetchTeamProfile,
   fetchMatchDetail,
-  debugRawGet,
+  fetchPlayerDetail,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -67,6 +67,7 @@ const PAST_MATCHES_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — un día ya j
 const FUTURE_MATCHES_TTL_MS = 6 * 60 * 60 * 1000; // 6 hs — fixture programado, rara vez se mueve
 const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
+const PLAYER_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs — mismo criterio que el equipo: perfil/estadísticas de jugador no cambian a cada rato
 const MATCH_DETAIL_TTL_MS = 30 * 1000; // 30 s — EN VIVO, alineado con el nuevo polling de MatchDetail.jsx (antes 2 min)
 const MATCH_DETAIL_FINAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — FINAL no cambia nunca más
 
@@ -230,6 +231,27 @@ app.get("/api/teams/:id", async (req, res) => {
   }
 });
 
+// GET /api/players/:id
+app.get("/api/players/:id", async (req, res) => {
+  const { id } = req.params;
+  const key = `player:${id}`;
+  try {
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo ficha del jugador ${id} a BSD...`);
+        return fetchPlayerDetail(id);
+      },
+      PLAYER_PROFILE_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
+  } catch (err) {
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
+  }
+});
+
 // GET /api/matches/:id -> detalle de un partido puntual (BSD
 // resuelve todo por el ID del partido, no hace falta pasar la liga).
 app.get("/api/matches/:id", async (req, res) => {
@@ -249,21 +271,6 @@ app.get("/api/matches/:id", async (req, res) => {
   } catch (err) {
     const stale = getCached(key);
     handleError(res, err, stale && { ...stale, stale: true });
-  }
-});
-
-// TEMPORAL — sacar después de inspeccionar formas de respuesta reales de
-// BSD que la doc no detalla (incidents, stats con shotmap). No expone la
-// key: solo hace el mismo proxy autenticado que ya hace el resto del
-// backend, contra un path fijo pasado por query.
-app.get("/api/debug/raw", async (req, res) => {
-  const { path } = req.query;
-  if (!path) return res.status(400).json({ error: "Falta ?path=" });
-  try {
-    const data = await debugRawGet(path);
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
 });
 
