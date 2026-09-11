@@ -12,6 +12,7 @@ const {
   fetchMatchDetail,
   fetchPlayerDetail,
   fetchCompetitionDetail,
+  debugRawGet,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -276,6 +277,18 @@ app.get("/api/leagues/:id", async (req, res) => {
   } catch (err) {
     const stale = getCached(key);
     handleError(res, err, stale && { ...stale, stale: true });
+  }
+});
+
+// TEMPORAL — sacar después de inspeccionar formas de respuesta reales.
+app.get("/api/debug/raw", async (req, res) => {
+  const { path } = req.query;
+  if (!path) return res.status(400).json({ error: "Falta ?path=" });
+  try {
+    const data = await debugRawGet(path);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

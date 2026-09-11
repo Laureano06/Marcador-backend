@@ -927,4 +927,5 @@ module.exports = {
   fetchMatchDetail,
   fetchPlayerDetail,
   fetchCompetitionDetail,
+  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
 };
