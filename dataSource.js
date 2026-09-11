@@ -823,6 +823,100 @@ async function fetchPlayerDetail(playerId) {
   };
 }
 
+function leagueLogoUrl(leagueId) {
+  return leagueId ? `${IMG_BASE}/league/${leagueId}/` : null;
+}
+
+function normalizeStandingRow(row) {
+  return {
+    position: row.position,
+    teamId: row.team_id,
+    teamName: row.team_name,
+    played: row.played,
+    won: row.won,
+    drawn: row.drawn,
+    lost: row.lost,
+    goalsFor: row.gf,
+    goalsAgainst: row.ga,
+    goalDiff: row.gd,
+    points: row.pts,
+    xgFor: row.xgf ?? null,
+    xgAgainst: row.xga ?? null,
+    form: row.form || null,
+    zone: row.zone ? { label: row.zone.label, type: row.zone.type } : null,
+  };
+}
+
+function normalizeLeaderboard(res) {
+  if (!res?.leaders?.length) return null;
+  return res.leaders.map((l) => ({
+    rank: l.rank,
+    playerId: l.player_id,
+    playerName: l.player_name,
+    position: l.position || null,
+    teamId: l.team_id,
+    teamName: l.team_name,
+    value: l.value,
+    matches: l.matches,
+  }));
+}
+
+// Ficha de UNA competencia: info + tabla de posiciones + goleadores +
+// asistencias, para la temporada dada (por default, la temporada actual
+// de la liga). La tabla puede venir plana (ligas) o agrupada (copas con
+// fase de grupos) — se normaliza a la MISMA forma en los dos casos
+// (lista de tablas, cada una con su nombre de grupo o null) para que el
+// frontend no tenga que saber cuál de las dos formas le llegó.
+async function fetchCompetitionDetail(leagueId, seasonId) {
+  const league = await apiGet(`/leagues/${leagueId}/`);
+  const resolvedSeasonId = seasonId || league.current_season?.id;
+
+  const seasonQuery = resolvedSeasonId ? `?season_id=${resolvedSeasonId}` : "";
+  const [standingsRes, scorersRes, assistsRes] = await Promise.all([
+    apiGet(`/leagues/${leagueId}/standings/${seasonQuery}`).catch((err) => {
+      console.error(`[dataSource] no se pudo obtener la tabla de la liga ${leagueId}:`, err.message);
+      return null;
+    }),
+    resolvedSeasonId
+      ? apiGet(`/leagues/${leagueId}/top/scorers/?season_id=${resolvedSeasonId}&limit=20`).catch((err) => {
+          console.error(`[dataSource] no se pudieron obtener los goleadores de la liga ${leagueId}:`, err.message);
+          return null;
+        })
+      : Promise.resolve(null),
+    resolvedSeasonId
+      ? apiGet(`/leagues/${leagueId}/top/assists/?season_id=${resolvedSeasonId}&limit=20`).catch((err) => {
+          console.error(`[dataSource] no se pudieron obtener las asistencias de la liga ${leagueId}:`, err.message);
+          return null;
+        })
+      : Promise.resolve(null),
+  ]);
+
+  let standings = null;
+  if (standingsRes?.grouped && standingsRes.groups) {
+    const tables = Object.entries(standingsRes.groups).map(([groupName, rows]) => ({
+      groupName,
+      rows: rows.map(normalizeStandingRow),
+    }));
+    if (tables.length) standings = tables;
+  } else if (standingsRes?.standings?.length) {
+    standings = [{ groupName: null, rows: standingsRes.standings.map(normalizeStandingRow) }];
+  }
+
+  return {
+    id: league.id,
+    name: league.name,
+    country: league.country || null,
+    logo: leagueLogoUrl(league.id),
+    isWomen: !!league.is_women,
+    season: league.current_season
+      ? { id: league.current_season.id, name: league.current_season.name, year: league.current_season.year }
+      : null,
+    standings,
+    topScorers: normalizeLeaderboard(scorersRes),
+    topAssists: normalizeLeaderboard(assistsRes),
+  };
+}
+
 module.exports = {
   fetchMatchesForDate,
   searchTeams,
@@ -830,5 +924,5 @@ module.exports = {
   fetchTeamProfile,
   fetchMatchDetail,
   fetchPlayerDetail,
-  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
+  fetchCompetitionDetail,
 };

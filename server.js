@@ -11,7 +11,7 @@ const {
   fetchTeamProfile,
   fetchMatchDetail,
   fetchPlayerDetail,
-  debugRawGet,
+  fetchCompetitionDetail,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -69,6 +69,7 @@ const FUTURE_MATCHES_TTL_MS = 6 * 60 * 60 * 1000; // 6 hs — fixture programado
 const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
 const PLAYER_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs — mismo criterio que el equipo: perfil/estadísticas de jugador no cambian a cada rato
+const COMPETITION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hs — tabla/goleadores cambian por jornada, no hace falta más frecuencia que esa
 const MATCH_DETAIL_TTL_MS = 30 * 1000; // 30 s — EN VIVO, alineado con el nuevo polling de MatchDetail.jsx (antes 2 min)
 const MATCH_DETAIL_FINAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — FINAL no cambia nunca más
 
@@ -253,15 +254,28 @@ app.get("/api/players/:id", async (req, res) => {
   }
 });
 
-// TEMPORAL — sacar después de inspeccionar formas de respuesta reales.
-app.get("/api/debug/raw", async (req, res) => {
-  const { path } = req.query;
-  if (!path) return res.status(400).json({ error: "Falta ?path=" });
+// GET /api/leagues/:id?season=123 -> ficha de competencia: info, tabla,
+// goleadores/asistencias. `season` es opcional (por default la
+// temporada actual de la liga) — se cachea por separado por temporada
+// para no mezclar la tabla de una edición vieja con la de la actual.
+app.get("/api/leagues/:id", async (req, res) => {
+  const { id } = req.params;
+  const { season } = req.query;
+  const key = `league:${id}:${season || "current"}`;
   try {
-    const data = await debugRawGet(path);
-    res.json(data);
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo ficha de la competencia ${id} a BSD...`);
+        return fetchCompetitionDetail(id, season);
+      },
+      COMPETITION_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
   }
 });
 
