@@ -763,4 +763,5 @@ module.exports = {
   fetchTeamProfile,
   fetchMatchDetail,
   fetchPlayerDetail,
+  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
 };
