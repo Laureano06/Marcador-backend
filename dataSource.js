@@ -230,10 +230,15 @@ function normalizeIncident(raw) {
     };
   }
   if (raw.type === "period") {
+    // "HT"/"FT" ya son abreviaturas universales, se muestran tal cual.
+    // "FIRST HALF"/"SECOND HALF" (fase en curso, no un corte de tiempo)
+    // vienen en inglés sin abreviar — se traducen para no desentonar con
+    // el resto de la pantalla, que está toda en español.
+    const PERIOD_LABEL_ES = { "FIRST HALF": "1ER TIEMPO", "SECOND HALF": "2DO TIEMPO" };
     return {
       type: "period",
       minute: raw.minute,
-      label: raw.text, // "HT" | "FT" | ...
+      label: PERIOD_LABEL_ES[raw.text] || raw.text,
       score: { home: raw.home_score, away: raw.away_score },
     };
   }
@@ -401,6 +406,11 @@ async function searchLeagues(query) {
 }
 
 const POSITION_EXPAND = { G: "Goalkeepers", D: "Defenders", M: "Midfielders", F: "Forwards" };
+// Mismas 4 posiciones que POSITION_EXPAND, pero en singular y en
+// español — POSITION_EXPAND nombra GRUPOS para el plantel (TeamDetail.jsx
+// las vuelve a traducir para el título de cada grupo), no sirve para
+// mostrar la posición de UN jugador puntual en su propia ficha.
+const POSITION_SINGULAR = { G: "Arquero", D: "Defensor", M: "Mediocampista", F: "Delantero" };
 
 function ageFromDob(dob) {
   const birth = new Date(dob);
@@ -715,7 +725,7 @@ async function fetchPlayerDetail(playerId) {
     id: info.id,
     name: info.name,
     shortName: info.short_name || info.name,
-    position: POSITION_EXPAND[info.position] || info.position || null,
+    position: POSITION_SINGULAR[info.position] || info.position || null,
     number: info.jersey_number,
     photo: playerPhotoUrl(info.id),
     age: info.date_of_birth ? ageFromDob(info.date_of_birth) : null,
