@@ -590,9 +590,16 @@ async function fetchMatchDetail(matchId) {
     ];
     const h = flattenStatsSide(statsRes.stats.home);
     const a = flattenStatsSide(statsRes.stats.away);
-    statistics = [...BASE_LABELS, ...EXTENDED_STAT_LABELS]
+    const rows = [...BASE_LABELS, ...EXTENDED_STAT_LABELS]
       .map(([key, label]) => ({ label, home: h[key] ?? null, away: a[key] ?? null }))
       .filter((row) => row.home !== null || row.away !== null);
+    // BSD puede mandar un objeto stats "vacío" (todos los campos en
+    // null) para un partido recién arrancado o con poca cobertura — sin
+    // esto, statistics quedaba en `[]` (verdadero en JS) en vez de null,
+    // y el frontend mostraba el título "Estadísticas" sin ninguna fila
+    // debajo en vez de ocultar la sección entera (RULE 1: no secciones
+    // vacías).
+    statistics = rows.length > 0 ? rows : null;
 
     if (Array.isArray(statsRes.shotmap) && statsRes.shotmap.length > 0) {
       shotmap = statsRes.shotmap.map((s) => ({
@@ -666,10 +673,8 @@ async function fetchMatchDetail(matchId) {
     };
   }
 
-  const events =
-    incidentsRes?.incidents?.length > 0
-      ? incidentsRes.incidents.map(normalizeIncident).filter(Boolean)
-      : null;
+  const normalizedEvents = (incidentsRes?.incidents || []).map(normalizeIncident).filter(Boolean);
+  const events = normalizedEvents.length > 0 ? normalizedEvents : null;
 
   // Estadísticas individuales de cada jugador que participó — no trae
   // nombre, solo player_id (se resuelve del lado del frontend contra la
