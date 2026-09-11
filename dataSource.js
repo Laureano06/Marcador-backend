@@ -517,7 +517,7 @@ async function fetchMatchDetail(matchId) {
   const wantStats = status !== "scheduled";
   const wantPrediction = status === "scheduled";
 
-  const [statsRes, lineupsRes, predictionRes, incidentsRes, playerStatsRes, homeForm, awayForm] =
+  const [statsRes, lineupsRes, predictionRes, incidentsRes, playerStatsRes, homeForm, awayForm, refereeRes, venueRes] =
     await Promise.all([
       wantStats
         ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
@@ -549,6 +549,10 @@ async function fetchMatchDetail(matchId) {
         : Promise.resolve(null),
       info.home_team_id ? fetchRecentForm(info.home_team_id, info.event_date) : Promise.resolve(null),
       info.away_team_id ? fetchRecentForm(info.away_team_id, info.event_date) : Promise.resolve(null),
+      info.referee_id
+        ? apiGet(`/referees/${info.referee_id}/`).catch(() => null)
+        : Promise.resolve(null),
+      info.venue_id ? apiGet(`/venues/${info.venue_id}/`).catch(() => null) : Promise.resolve(null),
     ]);
 
   let statistics = null;
@@ -731,6 +735,8 @@ async function fetchMatchDetail(matchId) {
     isDerby: !!info.is_local_derby,
     attendance: info.attendance ?? null,
     weather,
+    referee: refereeRes ? { id: refereeRes.id, name: refereeRes.name } : null,
+    venue: venueRes ? { id: venueRes.id, name: venueRes.name, city: venueRes.city } : null,
     h2h,
     form: homeForm?.length || awayForm?.length ? { home: homeForm, away: awayForm } : null,
     highlights: info.highlights?.length ? info.highlights : null,
@@ -919,6 +925,106 @@ async function fetchCompetitionDetail(leagueId, seasonId) {
   };
 }
 
+// Ficha de UN árbitro: perfil + promedios de tarjetas/goles/faltas por
+// partido (ya calculados por BSD, no se derivan acá) + sus últimos
+// partidos dirigidos.
+async function fetchRefereeDetail(refereeId) {
+  const [info, matchesRes] = await Promise.all([
+    apiGet(`/referees/${refereeId}/`),
+    apiGet(`/referees/${refereeId}/matches/?limit=5`).catch((err) => {
+      console.error(`[dataSource] no se pudieron obtener partidos del árbitro ${refereeId}:`, err.message);
+      return null;
+    }),
+  ]);
+
+  const recentMatches = listItems(matchesRes).map((m) => ({
+    id: m.id,
+    home: m.home_team,
+    away: m.away_team,
+    homeScore: m.home_score,
+    awayScore: m.away_score,
+    date: m.event_date,
+  }));
+
+  return {
+    id: info.id,
+    name: info.name,
+    country: info.country || null,
+    matches: info.matches,
+    totalYellowCards: info.total_yellow_cards,
+    totalRedCards: info.total_red_cards,
+    avgYellowPerMatch: info.avg_yellow_per_match ?? null,
+    avgRedPerMatch: info.avg_red_per_match ?? null,
+    avgGoalsPerMatch: info.avg_goals_per_match ?? null,
+    avgFoulsPerMatch: info.avg_fouls_per_match ?? null,
+    careerGames: info.career_games ?? null,
+    recentMatches: recentMatches.length ? recentMatches : null,
+  };
+}
+
+// Ficha de UN entrenador: perfil + estadísticas agregadas (ya calculadas
+// por BSD) + trayectoria (equipos dirigidos, con fecha y rendimiento en
+// cada uno).
+async function fetchManagerDetail(managerId) {
+  const [info, careerRes] = await Promise.all([
+    apiGet(`/managers/${managerId}/`),
+    apiGet(`/managers/${managerId}/career/`).catch((err) => {
+      console.error(`[dataSource] no se pudo obtener la trayectoria del entrenador ${managerId}:`, err.message);
+      return null;
+    }),
+  ]);
+
+  const career = (careerRes?.tenures || []).map((t) => ({
+    teamId: t.team_id,
+    teamName: t.team_name,
+    dateFrom: t.date_from,
+    dateTo: t.date_to,
+    matches: t.matches,
+    wins: t.wins,
+    draws: t.draws,
+    losses: t.losses,
+    winPct: t.win_pct ?? null,
+  }));
+
+  return {
+    id: info.id,
+    name: info.name,
+    shortName: info.short_name || info.name,
+    country: info.country || null,
+    tacticalProfile: info.tactical_profile || null,
+    preferredFormation: info.preferred_formation || null,
+    currentTeamId: info.current_team_id ?? null,
+    matchesTotal: info.matches_total,
+    wins: info.wins,
+    draws: info.draws,
+    losses: info.losses,
+    winPct: info.win_pct ?? null,
+    avgGoalsScored: info.avg_goals_scored ?? null,
+    avgGoalsConceded: info.avg_goals_conceded ?? null,
+    avgPossession: info.avg_possession ?? null,
+    cleanSheetPct: info.clean_sheet_pct ?? null,
+    bttsPct: info.btts_pct ?? null,
+    over25Pct: info.over_25_pct ?? null,
+    career: career.length ? career : null,
+  };
+}
+
+// Ficha de UN estadio: datos básicos + equipo local (si tiene uno fijo).
+async function fetchVenueDetail(venueId) {
+  const info = await apiGet(`/venues/${venueId}/`);
+  return {
+    id: info.id,
+    name: info.name,
+    city: info.city || null,
+    country: info.country || null,
+    capacity: info.capacity ?? null,
+    pitchLengthM: info.pitch_length_m ?? null,
+    pitchWidthM: info.pitch_width_m ?? null,
+    builtYear: info.built_year ?? null,
+    homeTeamId: info.home_team_id ?? null,
+  };
+}
+
 module.exports = {
   fetchMatchesForDate,
   searchTeams,
@@ -927,5 +1033,7 @@ module.exports = {
   fetchMatchDetail,
   fetchPlayerDetail,
   fetchCompetitionDetail,
-  debugRawGet: apiGet, // TEMPORAL — sacar después de inspeccionar formas de respuesta reales
+  fetchRefereeDetail,
+  fetchManagerDetail,
+  fetchVenueDetail,
 };

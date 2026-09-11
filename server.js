@@ -12,7 +12,9 @@ const {
   fetchMatchDetail,
   fetchPlayerDetail,
   fetchCompetitionDetail,
-  debugRawGet,
+  fetchRefereeDetail,
+  fetchManagerDetail,
+  fetchVenueDetail,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -71,6 +73,7 @@ const SEARCH_TTL_MS = 60 * 60 * 1000; // 1 hora
 const TEAM_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs
 const PLAYER_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs — mismo criterio que el equipo: perfil/estadísticas de jugador no cambian a cada rato
 const COMPETITION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hs — tabla/goleadores cambian por jornada, no hace falta más frecuencia que esa
+const PERSON_PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hs — árbitro/DT/estadio: mismo criterio que jugador/equipo
 const MATCH_DETAIL_TTL_MS = 30 * 1000; // 30 s — EN VIVO, alineado con el nuevo polling de MatchDetail.jsx (antes 2 min)
 const MATCH_DETAIL_FINAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días — FINAL no cambia nunca más
 
@@ -280,15 +283,66 @@ app.get("/api/leagues/:id", async (req, res) => {
   }
 });
 
-// TEMPORAL — sacar después de inspeccionar formas de respuesta reales.
-app.get("/api/debug/raw", async (req, res) => {
-  const { path } = req.query;
-  if (!path) return res.status(400).json({ error: "Falta ?path=" });
+// GET /api/referees/:id
+app.get("/api/referees/:id", async (req, res) => {
+  const { id } = req.params;
+  const key = `referee:${id}`;
   try {
-    const data = await debugRawGet(path);
-    res.json(data);
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo ficha del árbitro ${id} a BSD...`);
+        return fetchRefereeDetail(id);
+      },
+      PERSON_PROFILE_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
+  }
+});
+
+// GET /api/managers/:id
+app.get("/api/managers/:id", async (req, res) => {
+  const { id } = req.params;
+  const key = `manager:${id}`;
+  try {
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo ficha del entrenador ${id} a BSD...`);
+        return fetchManagerDetail(id);
+      },
+      PERSON_PROFILE_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
+  } catch (err) {
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
+  }
+});
+
+// GET /api/venues/:id
+app.get("/api/venues/:id", async (req, res) => {
+  const { id } = req.params;
+  const key = `venue:${id}`;
+  try {
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo ficha del estadio ${id} a BSD...`);
+        return fetchVenueDetail(id);
+      },
+      PERSON_PROFILE_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
+  } catch (err) {
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
   }
 });
 
