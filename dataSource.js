@@ -1228,4 +1228,5 @@ module.exports = {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
+  debugRawGet: apiGet,
 };
