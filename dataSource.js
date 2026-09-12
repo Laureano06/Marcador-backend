@@ -543,6 +543,7 @@ async function fetchMatchDetail(matchId) {
     venueRes,
     homeCoachRes,
     awayCoachRes,
+    oddsRes,
   ] = await Promise.all([
       wantStats
         ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
@@ -584,6 +585,14 @@ async function fetchMatchDetail(matchId) {
       info.away_coach_id
         ? apiGet(`/managers/${info.away_coach_id}/`).catch(() => null)
         : Promise.resolve(null),
+      // A diferencia de /prediction/ (solo antes del partido), BSD sigue
+      // devolviendo la última cuota conocida en vivo y hasta después de
+      // terminado (con next_update_at null) — se pide siempre, sin gatear
+      // por estado.
+      apiGet(`/events/${matchId}/odds/`).catch((err) => {
+        console.error(`[dataSource] no se pudieron obtener cuotas del partido ${matchId}:`, err.message);
+        return null;
+      }),
     ]);
 
   let statistics = null;
@@ -727,6 +736,29 @@ async function fetchMatchDetail(matchId) {
     };
   }
 
+  // Cuota consensuada (promedio entre casas, no por casa individual — ese
+  // desglose por bookmaker requiere un plan de BSD que no tenemos, ver
+  // /odds/comparison/ en el schema). BSD deja todos estos mercados en
+  // null cuando el partido no tiene cuotas cargadas, así que alcanza con
+  // chequear home_win para saber si hay algo que mostrar.
+  const odds =
+    oddsRes?.odds?.home_win != null
+      ? {
+          homeWin: oddsRes.odds.home_win,
+          draw: oddsRes.odds.draw,
+          awayWin: oddsRes.odds.away_win,
+          over15: oddsRes.odds.over_15_goals,
+          over25: oddsRes.odds.over_25_goals,
+          over35: oddsRes.odds.over_35_goals,
+          under15: oddsRes.odds.under_15_goals,
+          under25: oddsRes.odds.under_25_goals,
+          under35: oddsRes.odds.under_35_goals,
+          bttsYes: oddsRes.odds.btts_yes,
+          bttsNo: oddsRes.odds.btts_no,
+          lastUpdateAt: oddsRes.last_update_at || null,
+        }
+      : null;
+
   const h2h = info.head_to_head
     ? {
         totalMatches: info.head_to_head.total_matches,
@@ -787,6 +819,7 @@ async function fetchMatchDetail(matchId) {
     lineupsAreProbable: lineupsRes?.lineup_status === "predicted",
     unavailablePlayers,
     predictions,
+    odds,
   };
 }
 
@@ -1147,5 +1180,4 @@ module.exports = {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
-  debugRawGet: apiGet,
 };
