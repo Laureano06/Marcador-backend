@@ -1291,5 +1291,4 @@ module.exports = {
   fetchVenueDetail,
   fetchTransfers,
   fetchBestXI,
-  debugRawGet: apiGet,
 };
