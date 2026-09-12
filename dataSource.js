@@ -791,6 +791,15 @@ async function fetchMatchDetail(matchId) {
         }))
     : null;
 
+  // Positivo = presión del local, negativo = presión del visitante —
+  // confirmado con un partido real lateral (Barcelona 5-1 Feyenoord: 77
+  // de 92 minutos en positivo), no supuesto de la documentación. Viene
+  // en el mismo /stats/ que ya se pedía para el resto de las
+  // estadísticas — sin request extra.
+  const momentum = Array.isArray(statsRes?.momentum) && statsRes.momentum.length > 0
+    ? statsRes.momentum.map((m) => ({ minute: m.m, value: m.v }))
+    : null;
+
   const social = socialRes?.results?.length
     ? socialRes.results.map((s) => ({
         id: s.id,
@@ -868,6 +877,7 @@ async function fetchMatchDetail(matchId) {
     odds,
     broadcasts,
     social,
+    momentum,
   };
 }
 
@@ -1228,5 +1238,4 @@ module.exports = {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
-  debugRawGet: apiGet,
 };
