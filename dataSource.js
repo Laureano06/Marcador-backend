@@ -547,6 +547,7 @@ async function fetchMatchDetail(matchId) {
     oddsRes,
     broadcastsRes,
     socialRes,
+    metadataRes,
   ] = await Promise.all([
       wantStats
         ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
@@ -608,6 +609,16 @@ async function fetchMatchDetail(matchId) {
       // heurística NLP con falsos positivos documentados por BSD mismo.
       apiGet(`/events/${matchId}/social/?limit=15`).catch((err) => {
         console.error(`[dataSource] no se pudo obtener contenido social del partido ${matchId}:`, err.message);
+        return null;
+      }),
+      // Solo se usan los "funfacts" (récords/rachas concretas) de acá — el
+      // "ai_preview" que trae el mismo endpoint es texto narrativo
+      // generado por un modelo del lado de BSD, con predicción de
+      // resultado y de titulares incluida; a propósito no se muestra:
+      // si se equivoca (o inventa algo), en la pantalla se ve como un
+      // error nuestro, no de una IA de terceros.
+      apiGet(`/events/${matchId}/metadata/`).catch((err) => {
+        console.error(`[dataSource] no se pudieron obtener datos curiosos del partido ${matchId}:`, err.message);
         return null;
       }),
     ]);
@@ -800,6 +811,10 @@ async function fetchMatchDetail(matchId) {
     ? statsRes.momentum.map((m) => ({ minute: m.m, value: m.v }))
     : null;
 
+  const funFacts = metadataRes?.funfacts?.length
+    ? metadataRes.funfacts.map((f) => f.sentence).filter(Boolean)
+    : null;
+
   const social = socialRes?.results?.length
     ? socialRes.results.map((s) => ({
         id: s.id,
@@ -878,6 +893,7 @@ async function fetchMatchDetail(matchId) {
     broadcasts,
     social,
     momentum,
+    funFacts,
   };
 }
 
@@ -1075,6 +1091,42 @@ async function fetchCompetitionDetail(leagueId, seasonId) {
   };
 }
 
+// Once ideal de la temporada — mismo criterio de resolución de
+// temporada que fetchCompetitionDetail (sin season explícito, se usa la
+// actual de la liga). BSD exige al menos 450 minutos jugados para
+// calificar, así que un arranque de temporada devuelve arrays vacíos
+// por posición — eso ya se interpreta como "todavía no hay datos" en
+// vez de un error (RULE 1, ver server.js).
+async function fetchBestXI(leagueId, seasonId) {
+  const resolvedSeasonId = seasonId || (await apiGet(`/leagues/${leagueId}/`)).current_season?.id;
+  if (!resolvedSeasonId) return null;
+
+  const json = await apiGet(`/leagues/${leagueId}/bestxi/${resolvedSeasonId}/`);
+  const hasAnyPlayer = Object.values(json.lineup || {}).some((arr) => arr.length > 0);
+  if (!hasAnyPlayer) return null;
+
+  const mapPlayer = (p) => ({
+    playerId: p.player_id,
+    playerName: p.player_name,
+    teamId: p.team_id,
+    teamName: p.team_name,
+    photo: playerPhotoUrl(p.player_id),
+    avgRating: p.avg_rating,
+    matches: p.matches,
+    goals: p.goals,
+    assists: p.assists,
+  });
+
+  return {
+    formation: json.formation,
+    season: json.season ? { id: json.season.id, name: json.season.name, year: json.season.year } : null,
+    goalkeepers: (json.lineup.G || []).map(mapPlayer),
+    defenders: (json.lineup.D || []).map(mapPlayer),
+    midfielders: (json.lineup.M || []).map(mapPlayer),
+    forwards: (json.lineup.F || []).map(mapPlayer),
+  };
+}
+
 // Ficha de UN árbitro: perfil + promedios de tarjetas/goles/faltas por
 // partido (ya calculados por BSD, no se derivan acá) + sus últimos
 // partidos dirigidos.
@@ -1238,5 +1290,5 @@ module.exports = {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
-  debugRawGet: apiGet,
+  fetchBestXI,
 };

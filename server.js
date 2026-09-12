@@ -17,7 +17,7 @@ const {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
-  debugRawGet,
+  fetchBestXI,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -287,6 +287,29 @@ app.get("/api/leagues/:id", async (req, res) => {
   }
 });
 
+// GET /api/leagues/:id/bestxi?season=123 -> once ideal de la temporada
+// (mismo default de temporada que /api/leagues/:id).
+app.get("/api/leagues/:id/bestxi", async (req, res) => {
+  const { id } = req.params;
+  const { season } = req.query;
+  const key = `bestxi:${id}:${season || "current"}`;
+  try {
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo once ideal de la competencia ${id} a BSD...`);
+        return fetchBestXI(id, season);
+      },
+      COMPETITION_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
+  } catch (err) {
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
+  }
+});
+
 // GET /api/referees/:id
 app.get("/api/referees/:id", async (req, res) => {
   const { id } = req.params;
@@ -405,16 +428,6 @@ app.get("/api/quota", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.set("Cache-Control", "no-store");
   res.json({ ok: true });
-});
-
-app.get("/api/debug/raw", async (req, res) => {
-  try {
-    const data = await debugRawGet(req.query.path);
-    res.set("Cache-Control", "no-store");
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // Precarga el feed de partidos de HOY al arrancar, en background, sin
