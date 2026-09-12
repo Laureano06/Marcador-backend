@@ -530,6 +530,7 @@ async function fetchMatchDetail(matchId) {
 
   const wantStats = status !== "scheduled";
   const wantPrediction = status === "scheduled";
+  const wantBroadcasts = status !== "final"; // nadie busca "dónde ver" un partido ya terminado
 
   const [
     statsRes,
@@ -544,6 +545,7 @@ async function fetchMatchDetail(matchId) {
     homeCoachRes,
     awayCoachRes,
     oddsRes,
+    broadcastsRes,
   ] = await Promise.all([
       wantStats
         ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
@@ -593,6 +595,12 @@ async function fetchMatchDetail(matchId) {
         console.error(`[dataSource] no se pudieron obtener cuotas del partido ${matchId}:`, err.message);
         return null;
       }),
+      wantBroadcasts
+        ? apiGet(`/events/${matchId}/broadcasts/?limit=100`).catch((err) => {
+            console.error(`[dataSource] no se pudieron obtener transmisiones del partido ${matchId}:`, err.message);
+            return null;
+          })
+        : Promise.resolve(null),
     ]);
 
   let statistics = null;
@@ -759,6 +767,21 @@ async function fetchMatchDetail(matchId) {
         }
       : null;
 
+  // "Dónde ver" — un canal por país que transmite este partido puntual.
+  // BSD ya devuelve nombre/país de equipos y liga en cada fila (redundante
+  // acá, el resto de la ficha ya lo tiene), así que solo se toma lo que
+  // hace falta para listar canales.
+  const broadcasts = broadcastsRes?.results?.length
+    ? broadcastsRes.results
+        .filter((b) => b.channel_name)
+        .map((b) => ({
+          id: b.id,
+          countryCode: b.country_code || null,
+          channelName: b.channel_name,
+          channelLink: b.channel_link || null,
+        }))
+    : null;
+
   const h2h = info.head_to_head
     ? {
         totalMatches: info.head_to_head.total_matches,
@@ -820,6 +843,7 @@ async function fetchMatchDetail(matchId) {
     unavailablePlayers,
     predictions,
     odds,
+    broadcasts,
   };
 }
 
@@ -1180,5 +1204,4 @@ module.exports = {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
-  debugRawGet: apiGet,
 };
