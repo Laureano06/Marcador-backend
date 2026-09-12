@@ -17,6 +17,7 @@ const {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
+  debugRawGet,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -404,6 +405,16 @@ app.get("/api/quota", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.set("Cache-Control", "no-store");
   res.json({ ok: true });
+});
+
+app.get("/api/debug/raw", async (req, res) => {
+  try {
+    const data = await debugRawGet(req.query.path);
+    res.set("Cache-Control", "no-store");
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Precarga el feed de partidos de HOY al arrancar, en background, sin
