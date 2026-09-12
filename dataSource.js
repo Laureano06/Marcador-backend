@@ -546,6 +546,7 @@ async function fetchMatchDetail(matchId) {
     awayCoachRes,
     oddsRes,
     broadcastsRes,
+    socialRes,
   ] = await Promise.all([
       wantStats
         ? apiGet(`/events/${matchId}/stats/`).catch((err) => {
@@ -601,6 +602,14 @@ async function fetchMatchDetail(matchId) {
             return null;
           })
         : Promise.resolve(null),
+      // Solo tweets/videos de cuentas oficiales de club + highlights de
+      // YouTube, vinculados por BSD al EVENTO (cuenta del club + ventana
+      // horaria del partido) — no la variante por jugador, esa sí es
+      // heurística NLP con falsos positivos documentados por BSD mismo.
+      apiGet(`/events/${matchId}/social/?limit=15`).catch((err) => {
+        console.error(`[dataSource] no se pudo obtener contenido social del partido ${matchId}:`, err.message);
+        return null;
+      }),
     ]);
 
   let statistics = null;
@@ -782,6 +791,20 @@ async function fetchMatchDetail(matchId) {
         }))
     : null;
 
+  const social = socialRes?.results?.length
+    ? socialRes.results.map((s) => ({
+        id: s.id,
+        type: s.type,
+        url: s.url,
+        text: s.text || s.title || "",
+        thumbnail: s.thumbnail || null,
+        accountName: s.account?.name || null,
+        accountHandle: s.account?.handle || null,
+        verified: !!s.account?.verified,
+        publishedAt: s.published_at || null,
+      }))
+    : null;
+
   const h2h = info.head_to_head
     ? {
         totalMatches: info.head_to_head.total_matches,
@@ -844,6 +867,7 @@ async function fetchMatchDetail(matchId) {
     predictions,
     odds,
     broadcasts,
+    social,
   };
 }
 
@@ -1204,5 +1228,4 @@ module.exports = {
   fetchManagerDetail,
   fetchVenueDetail,
   fetchTransfers,
-  debugRawGet: apiGet,
 };
