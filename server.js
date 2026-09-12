@@ -18,6 +18,7 @@ const {
   fetchVenueDetail,
   fetchTransfers,
   fetchBestXI,
+  fetchLeagueLeaders,
 } = require("./dataSource");
 const { getCached, getCachedMeta, isExpired } = require("./cache");
 const { getOrFetch } = require("./withCache");
@@ -299,6 +300,35 @@ app.get("/api/leagues/:id/bestxi", async (req, res) => {
       () => {
         console.log(`[api] pidiendo once ideal de la competencia ${id} a BSD...`);
         return fetchBestXI(id, season);
+      },
+      COMPETITION_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
+  } catch (err) {
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
+  }
+});
+
+// GET /api/leagues/:id/leaders?season=123 -> goleadores + asistencias.
+// Separado de /api/leagues/:id (ver comentario en fetchLeagueLeaders):
+// BSD puede tardar hasta ~1 min calculando esto para una temporada fría,
+// y no queremos que la tabla de posiciones espere a eso. `season` es
+// obligatorio acá (a diferencia de /api/leagues/:id): el frontend ya
+// tiene la temporada resuelta del pedido principal antes de llamar a
+// este.
+app.get("/api/leagues/:id/leaders", async (req, res) => {
+  const { id } = req.params;
+  const { season } = req.query;
+  if (!season) return res.status(400).json({ error: "Falta el parámetro season" });
+  const key = `leaders:${id}:${season}`;
+  try {
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo goleadores/asistencias de la competencia ${id} a BSD...`);
+        return fetchLeagueLeaders(id, season);
       },
       COMPETITION_TTL_MS
     );

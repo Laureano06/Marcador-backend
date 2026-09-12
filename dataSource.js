@@ -1025,23 +1025,11 @@ async function fetchCompetitionDetail(leagueId, seasonId) {
   const resolvedSeasonId = seasonId || league.current_season?.id;
 
   const seasonQuery = resolvedSeasonId ? `?season_id=${resolvedSeasonId}` : "";
-  const [standingsRes, scorersRes, assistsRes, seasonsRes] = await Promise.all([
+  const [standingsRes, seasonsRes] = await Promise.all([
     apiGet(`/leagues/${leagueId}/standings/${seasonQuery}`).catch((err) => {
       console.error(`[dataSource] no se pudo obtener la tabla de la liga ${leagueId}:`, err.message);
       return null;
     }),
-    resolvedSeasonId
-      ? apiGet(`/leagues/${leagueId}/top/scorers/?season_id=${resolvedSeasonId}&limit=20`).catch((err) => {
-          console.error(`[dataSource] no se pudieron obtener los goleadores de la liga ${leagueId}:`, err.message);
-          return null;
-        })
-      : Promise.resolve(null),
-    resolvedSeasonId
-      ? apiGet(`/leagues/${leagueId}/top/assists/?season_id=${resolvedSeasonId}&limit=20`).catch((err) => {
-          console.error(`[dataSource] no se pudieron obtener las asistencias de la liga ${leagueId}:`, err.message);
-          return null;
-        })
-      : Promise.resolve(null),
     // Historial de temporadas — punto 27 del plan. Un solo pedido extra
     // (cacheado junto con el resto de la ficha), no una request por
     // temporada: BSD ya devuelve la lista completa de una.
@@ -1086,6 +1074,30 @@ async function fetchCompetitionDetail(leagueId, seasonId) {
       ? seasonsRes.seasons.map((s) => ({ id: s.id, name: s.name, year: s.year }))
       : null,
     standings,
+  };
+}
+
+// Goleadores/asistencias separados de fetchCompetitionDetail a propósito
+// — medido en vivo contra una temporada fría (nadie la pidió en las
+// últimas 2hs): BSD tarda hasta ~19s en goleadores y ~58s en
+// asistencias calculando esos rankings al vuelo, mientras standings
+// responde en <1s. Si viajaran en el mismo Promise.all, TODA la ficha
+// de la competencia (tabla incluida) quedaba bloqueada por el más
+// lento de los dos. Temporada explícita y obligatoria acá: el
+// caller siempre la tiene ya resuelta (viene de fetchCompetitionDetail).
+async function fetchLeagueLeaders(leagueId, seasonId) {
+  const [scorersRes, assistsRes] = await Promise.all([
+    apiGet(`/leagues/${leagueId}/top/scorers/?season_id=${seasonId}&limit=20`).catch((err) => {
+      console.error(`[dataSource] no se pudieron obtener los goleadores de la liga ${leagueId}:`, err.message);
+      return null;
+    }),
+    apiGet(`/leagues/${leagueId}/top/assists/?season_id=${seasonId}&limit=20`).catch((err) => {
+      console.error(`[dataSource] no se pudieron obtener las asistencias de la liga ${leagueId}:`, err.message);
+      return null;
+    }),
+  ]);
+
+  return {
     topScorers: normalizeLeaderboard(scorersRes),
     topAssists: normalizeLeaderboard(assistsRes),
   };
@@ -1291,4 +1303,5 @@ module.exports = {
   fetchVenueDetail,
   fetchTransfers,
   fetchBestXI,
+  fetchLeagueLeaders,
 };
