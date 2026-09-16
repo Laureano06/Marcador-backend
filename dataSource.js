@@ -436,15 +436,56 @@ function ageFromDob(dob) {
   return age;
 }
 
-// Ficha de equipo: info + plantel (2 requests en paralelo) + estadio si
-// tiene venue_id (1 request más). BSD no da founded ni "últimos
-// partidos" en esta ficha — se mantiene el mismo contrato que ya tenía
-// esta función con API-Football (sin recentForm), la migración no agrega
-// alcance nuevo.
+// Próximo partido para la ficha de equipo — mismo endpoint de fixtures
+// que fetchRecentForm (ver más abajo), pero para adelante en vez de para
+// atrás y sin filtro de resultado (todavía no lo tiene). BSD no tiene
+// "el próximo partido" como parámetro directo: se pide una ventana y se
+// toma el primero acá.
+async function fetchTeamNextMatch(teamId, leagues) {
+  try {
+    const now = new Date().toISOString();
+    // 60 días de ventana: alcanza para cualquier calendario real (ni la
+    // pretemporada más larga deja un equipo sin partido programado tanto
+    // tiempo) sin arriesgar traer de más.
+    const to = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+    const json = await apiGet(
+      `/teams/${teamId}/fixtures/?status=notstarted&limit=20&date_from=${encodeURIComponent(now)}&date_to=${encodeURIComponent(to)}`
+    );
+    const events = listItems(json);
+    events.sort((a, b) => a.event_date.localeCompare(b.event_date));
+    if (!events.length) return null;
+    const e = events[0];
+    const isHome = e.home_team_id === Number(teamId);
+    return {
+      id: e.id,
+      date: e.event_date,
+      competition: leagues?.get(e.league_id)?.name || null,
+      isHome,
+      opponentId: isHome ? e.away_team_id : e.home_team_id,
+      opponentName: isHome ? e.away_team : e.home_team,
+      opponentCrest: crestUrl(isHome ? e.away_team_id : e.home_team_id),
+    };
+  } catch (err) {
+    console.error(`[dataSource] no se pudo obtener el próximo partido del equipo ${teamId}:`, err.message);
+    return null;
+  }
+}
+
+// Ficha de equipo: info + plantel + últimos partidos + próximo partido
+// (4 requests en paralelo) + estadio si tiene venue_id (1 request más).
+// Últimos partidos reusa fetchRecentForm (más abajo) — mismo dato que ya
+// se pedía para el match center, acá mostrado completo en vez de
+// resumido a un chip W/D/L. BSD no da founded en esta ficha — se
+// mantiene ese hueco igual que antes, la migración no agrega ese dato
+// puntual.
 async function fetchTeamProfile(teamId) {
-  const [info, squadRes] = await Promise.all([
+  const leagues = await getLeagueDirectory();
+  const nowIso = new Date().toISOString();
+  const [info, squadRes, recentMatches, nextMatch] = await Promise.all([
     apiGet(`/teams/${teamId}/`),
     apiGet(`/teams/${teamId}/squad/`),
+    fetchRecentForm(teamId, nowIso, { limit: 5, leagues }),
+    fetchTeamNextMatch(teamId, leagues),
   ]);
 
   let venue = null;
@@ -479,15 +520,21 @@ async function fetchTeamProfile(teamId) {
     crest: crestUrl(info.id),
     venue,
     squad,
+    recentMatches,
+    nextMatch,
   };
 }
 
-// Últimos resultados de un equipo ANTES de una fecha dada (para mostrar
-// la forma reciente en la ficha del partido: quién llega mejor). Pide
-// una ventana amplia (300 días) para no quedarse corto con equipos de
-// competencias que juegan poco seguido, y filtra/ordena/recorta a 5 acá
-// — BSD no tiene un parámetro "dame los últimos N finalizados".
-async function fetchRecentForm(teamId, beforeIso) {
+// Últimos resultados de un equipo ANTES de una fecha dada — usado tanto
+// para la "forma reciente" del match center (quién llega mejor, limit=5
+// por default) como para la lista de últimos partidos de la ficha de
+// equipo (mismo dato, nada más que se muestra completo en vez de
+// resumirse a un chip W/D/L). Pide una ventana amplia (300 días) para no
+// quedarse corto con equipos de competencias que juegan poco seguido, y
+// filtra/ordena/recorta acá — BSD no tiene un parámetro "dame los
+// últimos N finalizados". `leagues` es opcional: sin él, `competition`
+// queda null (el match center no lo necesita, solo la ficha de equipo).
+async function fetchRecentForm(teamId, beforeIso, { limit = 5, leagues = null } = {}) {
   try {
     const from = new Date(new Date(beforeIso).getTime() - 300 * 24 * 60 * 60 * 1000).toISOString();
     const json = await apiGet(
@@ -495,15 +542,19 @@ async function fetchRecentForm(teamId, beforeIso) {
     );
     const events = listItems(json).filter((e) => e.home_score != null && e.away_score != null);
     events.sort((a, b) => b.event_date.localeCompare(a.event_date));
-    return events.slice(0, 5).map((e) => {
+    return events.slice(0, limit).map((e) => {
       const isHome = e.home_team_id === Number(teamId);
       const gf = isHome ? e.home_score : e.away_score;
       const ga = isHome ? e.away_score : e.home_score;
       return {
+        id: e.id,
         result: gf > ga ? "W" : gf < ga ? "L" : "D",
         goalsFor: gf,
         goalsAgainst: ga,
         opponent: isHome ? e.away_team : e.home_team,
+        opponentId: isHome ? e.away_team_id : e.home_team_id,
+        opponentCrest: crestUrl(isHome ? e.away_team_id : e.home_team_id),
+        competition: leagues?.get(e.league_id)?.name || null,
         isHome,
         date: e.event_date,
       };
