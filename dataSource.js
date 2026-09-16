@@ -459,6 +459,7 @@ async function fetchTeamNextMatch(teamId, leagues) {
     return {
       id: e.id,
       date: e.event_date,
+      leagueId: e.league_id,
       competition: leagues?.get(e.league_id)?.name || null,
       isHome,
       opponentId: isHome ? e.away_team_id : e.home_team_id,
@@ -469,6 +470,57 @@ async function fetchTeamNextMatch(teamId, leagues) {
     console.error(`[dataSource] no se pudo obtener el próximo partido del equipo ${teamId}:`, err.message);
     return null;
   }
+}
+
+// Calendario completo del equipo: TODOS los partidos jugados y por jugar
+// de la temporada (no solo los últimos 5 / el próximo), para la pestaña
+// "Calendario" de la ficha de equipo — al estilo de la pestaña PARTIDOS
+// de besoccer en la ficha de un club. Pide jugados y programados por
+// separado (mismo motivo que fetchRecentForm/fetchTeamNextMatch: BSD
+// filtra por status, no hay un "todos" explícito) sobre una ventana de
+// ±200 días, que cubre una temporada completa de punta a punta sin
+// arriesgarse a traer de más. Vive en su propio endpoint en vez de venir
+// con fetchTeamProfile a propósito: es la única sección de la ficha que
+// nadie pide la mayoría de las veces, así que solo cuesta cuota cuando
+// alguien realmente abre esa pestaña.
+async function fetchTeamCalendar(teamId) {
+  const leagues = await getLeagueDirectory();
+  const now = new Date();
+  const from = new Date(now.getTime() - 200 * 24 * 60 * 60 * 1000).toISOString();
+  const to = new Date(now.getTime() + 200 * 24 * 60 * 60 * 1000).toISOString();
+
+  function normalize(e) {
+    const isHome = e.home_team_id === Number(teamId);
+    const hasScore = e.home_score != null && e.away_score != null;
+    return {
+      id: e.id,
+      date: e.event_date,
+      status: statusFromBsd(e.status),
+      leagueId: e.league_id,
+      competition: leagues?.get(e.league_id)?.name || null,
+      isHome,
+      opponentId: isHome ? e.away_team_id : e.home_team_id,
+      opponentName: isHome ? e.away_team : e.home_team,
+      opponentCrest: crestUrl(isHome ? e.away_team_id : e.home_team_id),
+      goalsFor: hasScore ? (isHome ? e.home_score : e.away_score) : null,
+      goalsAgainst: hasScore ? (isHome ? e.away_score : e.home_score) : null,
+    };
+  }
+
+  const [playedJson, upcomingJson] = await Promise.all([
+    apiGet(
+      `/teams/${teamId}/fixtures/?status=finished&limit=100&date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(now.toISOString())}`
+    ),
+    apiGet(
+      `/teams/${teamId}/fixtures/?status=notstarted&limit=100&date_from=${encodeURIComponent(now.toISOString())}&date_to=${encodeURIComponent(to)}`
+    ),
+  ]);
+
+  const matches = [...listItems(playedJson), ...listItems(upcomingJson)]
+    .map(normalize)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  return { matches };
 }
 
 // Ficha de equipo: info + plantel + últimos partidos + próximo partido
@@ -554,6 +606,7 @@ async function fetchRecentForm(teamId, beforeIso, { limit = 5, leagues = null } 
         opponent: isHome ? e.away_team : e.home_team,
         opponentId: isHome ? e.away_team_id : e.home_team_id,
         opponentCrest: crestUrl(isHome ? e.away_team_id : e.home_team_id),
+        leagueId: e.league_id,
         competition: leagues?.get(e.league_id)?.name || null,
         isHome,
         date: e.event_date,
@@ -1205,7 +1258,9 @@ async function fetchRefereeDetail(refereeId) {
   const recentMatches = listItems(matchesRes).map((m) => ({
     id: m.id,
     home: m.home_team,
+    homeId: m.home_team_id,
     away: m.away_team,
+    awayId: m.away_team_id,
     homeScore: m.home_score,
     awayScore: m.away_score,
     date: m.event_date,
@@ -1346,6 +1401,7 @@ module.exports = {
   searchPlayers,
   searchLeagues,
   fetchTeamProfile,
+  fetchTeamCalendar,
   fetchMatchDetail,
   fetchPlayerDetail,
   fetchCompetitionDetail,

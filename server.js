@@ -10,6 +10,7 @@ const {
   searchLeagues,
   searchPlayers,
   fetchTeamProfile,
+  fetchTeamCalendar,
   fetchMatchDetail,
   fetchPlayerDetail,
   fetchCompetitionDetail,
@@ -231,6 +232,31 @@ app.get("/api/teams/:id", async (req, res) => {
       () => {
         console.log(`[api] pidiendo ficha del equipo ${id} a BSD...`);
         return fetchTeamProfile(id);
+      },
+      TEAM_PROFILE_TTL_MS
+    );
+    setCacheHeaders(res, getCachedMeta(key));
+    res.json(getCached(key));
+  } catch (err) {
+    const stale = getCached(key);
+    handleError(res, err, stale && { ...stale, stale: true });
+  }
+});
+
+// GET /api/teams/:id/calendar -> TODOS los partidos jugados y por jugar
+// de la temporada (no solo los últimos 5 / el próximo de /api/teams/:id).
+// Endpoint separado a propósito: es la pestaña que menos gente abre, así
+// que solo paga su cuota (2 requests BSD más que la ficha básica) quien
+// realmente la pide.
+app.get("/api/teams/:id/calendar", async (req, res) => {
+  const { id } = req.params;
+  const key = `team-calendar:${id}`;
+  try {
+    await getOrFetch(
+      key,
+      () => {
+        console.log(`[api] pidiendo calendario del equipo ${id} a BSD...`);
+        return fetchTeamCalendar(id);
       },
       TEAM_PROFILE_TTL_MS
     );
